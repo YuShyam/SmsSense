@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">SmsSense</string>
+    <string name="notif_service_label">SmsSense 白名單通知監聽</string>
+    <string name="prompt_service_label">SmsSense 登入彈窗唯讀感知</string>
+    <string name="prompt_service_desc">僅以唯讀方式偵測白名單 App 跳出之全畫面登入確認彈窗，並單向發送提醒至你的 Telegram（不包含任何點擊或操作功能）。</string>
+</resources>

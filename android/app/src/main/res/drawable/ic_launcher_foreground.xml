@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 與 DnsSense 同視覺語言：幾何訊息氣泡外框（安全區 24..84 內） -->
+    <path
+        android:fillColor="#16FFFFFF"
+        android:pathData="M33,31 L75,31 C78.9,31 82,34.1 82,38 L82,63 C82,66.9 78.9,70 75,70 L52,70 L39,80 C37.8,80.9 36,80.1 36,78.6 L36,70 L33,70 C29.1,70 26,66.9 26,63 L26,38 C26,34.1 29.1,31 33,31 Z"
+        android:strokeWidth="3.2"
+        android:strokeColor="#FFFAFAFA"
+        android:strokeLineJoin="round" />
+
+    <!-- 訊息內極簡紙飛機 / 單向轉發箭頭意象 -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M40,51 L66,43 L58,61 L52,53 Z"
+        android:strokeWidth="2.8"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineJoin="round" />
+
+    <!-- 同系列翡翠綠核心感測點 (Instant Forward Pulse) -->
+    <path
+        android:fillColor="#3810B981"
+        android:pathData="M74,34m-7.5,0a7.5,7.5 0,1 1,15 0a7.5,7.5 0,1 1,-15 0" />
+    <path
+        android:fillColor="#FF10B981"
+        android:pathData="M74,34m-4.2,0a4.2,4.2 0,1 1,8.4 0a4.2,4.2 0,1 1,-8.4 0" />
+</vector>

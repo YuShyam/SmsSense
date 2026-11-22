@@ -1,0 +1,27 @@
+# Android / Gradle
+.gradle/
+build/
+android/.gradle/
+android/build/
+android/*/build/
+android/local.properties
+android/.idea/
+android/*.iml
+android/.cxx/
+android/captures/
+*.apk
+*.aab
+*.keystore
+!android/app/debug.keystore
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*~
+.vscode/
+
+# Local private files
+backups/
+GEMINI.md

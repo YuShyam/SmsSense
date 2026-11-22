@@ -1,0 +1,1 @@
+-keep class com.yushyam.smssense.data.model.** { *; }
