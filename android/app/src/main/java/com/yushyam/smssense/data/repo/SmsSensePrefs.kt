@@ -7,11 +7,10 @@ import com.google.gson.JsonParser
 import com.yushyam.smssense.data.model.ForwardLogItem
 import com.yushyam.smssense.data.model.PendingForwardItem
 import com.yushyam.smssense.data.model.SmsSenseConfig
+import com.yushyam.smssense.data.model.TargetDestination
 
 /**
  * 防禦性設定、歷史紀錄與離線佇列儲存庫 (Schema-Safe Preferences Repository)
- *
- * 所有反序列化一律使用 JsonParser 逐欄解析，確保跨版本新增欄位時零 NullPointerException。
  */
 class SmsSensePrefs(context: Context) {
 
@@ -21,12 +20,23 @@ class SmsSensePrefs(context: Context) {
     fun loadConfig(): SmsSenseConfig = parseConfigJson(prefs.getString(KEY_CONFIG, null))
 
     fun saveConfig(config: SmsSenseConfig) {
+        val cleanThresholds = config.lowBatteryThresholds
+            .filter { it in 5..90 }
+            .distinct()
+            .sorted()
+            .ifEmpty { SmsSenseConfig.DEFAULT_BATTERY_THRESHOLDS }
+
         val clean = config.copy(
             deviceAlias = config.deviceAlias.trim(),
             telegramBotToken = config.telegramBotToken.trim(),
             telegramChatId = config.telegramChatId.trim(),
+            lineChannelAccessToken = config.lineChannelAccessToken.trim(),
+            lineTargetId = config.lineTargetId.trim(),
+            webhookUrl = config.webhookUrl.trim(),
+            webhookSecretHeader = config.webhookSecretHeader.trim(),
             whitelistedNotifPackages = config.whitelistedNotifPackages.map { it.trim() }.filter { it.isNotEmpty() }.distinct(),
-            whitelistedPromptPackages = config.whitelistedPromptPackages.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            whitelistedPromptPackages = config.whitelistedPromptPackages.map { it.trim() }.filter { it.isNotEmpty() }.distinct(),
+            lowBatteryThresholds = cleanThresholds
         )
         prefs.edit().putString(KEY_CONFIG, gson.toJson(clean)).apply()
     }
@@ -43,10 +53,18 @@ class SmsSensePrefs(context: Context) {
         prefs.edit().remove(KEY_LOGS).apply()
     }
 
-    fun isLowBatteryAlertSent(): Boolean = prefs.getBoolean(KEY_LOW_BATT_SENT, false)
+    fun loadSentBatteryThresholds(): Set<Int> {
+        val raw = prefs.getString(KEY_SENT_BATT_THRESHOLDS, null).orEmpty()
+        if (raw.isBlank()) return emptySet()
+        return raw.split(",").mapNotNull { it.trim().toIntOrNull() }.toSet()
+    }
 
-    fun setLowBatteryAlertSent(sent: Boolean) {
-        prefs.edit().putBoolean(KEY_LOW_BATT_SENT, sent).apply()
+    fun saveSentBatteryThresholds(thresholds: Set<Int>) {
+        if (thresholds.isEmpty()) {
+            prefs.edit().remove(KEY_SENT_BATT_THRESHOLDS).apply()
+        } else {
+            prefs.edit().putString(KEY_SENT_BATT_THRESHOLDS, thresholds.sorted().joinToString(",")).apply()
+        }
     }
 
     @Synchronized
@@ -68,14 +86,19 @@ class SmsSensePrefs(context: Context) {
         }
     }
 
+    @Synchronized
+    fun clearPendingQueue() {
+        prefs.edit().remove(KEY_PENDING).apply()
+    }
+
     companion object {
         private const val PREFS_NAME = "smssense_prefs"
         private const val KEY_CONFIG = "config_json"
         private const val KEY_LOGS = "logs_json"
         private const val KEY_PENDING = "pending_queue_json"
-        private const val KEY_LOW_BATT_SENT = "low_battery_alert_sent"
+        private const val KEY_SENT_BATT_THRESHOLDS = "sent_battery_thresholds"
         private const val MAX_LOGS = 50
-        private const val MAX_PENDING = 30
+        private const val MAX_PENDING = 50
 
         fun parseConfigJson(json: String?): SmsSenseConfig {
             if (json.isNullOrBlank()) return SmsSenseConfig()
@@ -83,11 +106,29 @@ class SmsSensePrefs(context: Context) {
                 val root = JsonParser.parseString(json)
                 if (!root.isJsonObject) return SmsSenseConfig()
                 val obj = root.asJsonObject
+
+                val multiThresholds = obj.optIntList("lowBatteryThresholds")
+                val resolvedThresholds = if (multiThresholds.isNotEmpty()) {
+                    multiThresholds.map { it.coerceIn(5, 90) }.distinct().sorted()
+                } else if (obj.has("lowBatteryThreshold")) {
+                    listOf(obj.optInt("lowBatteryThreshold", 20).coerceIn(5, 90))
+                } else {
+                    SmsSenseConfig.DEFAULT_BATTERY_THRESHOLDS
+                }
+
                 SmsSenseConfig(
                     enabled = obj.optBoolean("enabled", true),
                     deviceAlias = obj.optString("deviceAlias", ""),
+                    offlineQueueEnabled = obj.optBoolean("offlineQueueEnabled", true),
+                    telegramEnabled = obj.optBoolean("telegramEnabled", true),
                     telegramBotToken = obj.optString("telegramBotToken", ""),
                     telegramChatId = obj.optString("telegramChatId", ""),
+                    lineEnabled = obj.optBoolean("lineEnabled", false),
+                    lineChannelAccessToken = obj.optString("lineChannelAccessToken", ""),
+                    lineTargetId = obj.optString("lineTargetId", ""),
+                    webhookEnabled = obj.optBoolean("webhookEnabled", false),
+                    webhookUrl = obj.optString("webhookUrl", ""),
+                    webhookSecretHeader = obj.optString("webhookSecretHeader", ""),
                     smsForwardEnabled = obj.optBoolean("smsForwardEnabled", true),
                     appendOtpHint = obj.optBoolean("appendOtpHint", true),
                     notificationForwardEnabled = obj.optBoolean("notificationForwardEnabled", true),
@@ -99,7 +140,7 @@ class SmsSensePrefs(context: Context) {
                     ),
                     callForwardEnabled = obj.optBoolean("callForwardEnabled", true),
                     lowBatteryAlertEnabled = obj.optBoolean("lowBatteryAlertEnabled", true),
-                    lowBatteryThreshold = obj.optInt("lowBatteryThreshold", 20).coerceIn(5, 50)
+                    lowBatteryThresholds = resolvedThresholds
                 )
             } catch (_: Exception) {
                 SmsSenseConfig()
@@ -138,11 +179,18 @@ class SmsSensePrefs(context: Context) {
                     val o = elem.asJsonObject
                     val html = o.optString("formattedHtml", "")
                     if (html.isBlank()) return@mapNotNull null
+                    val plain = o.optString("formattedPlainText", html.replace(Regex("<[^>]+>"), ""))
+                    val targets = o.optStringList(
+                        "targetDestinations",
+                        listOf(TargetDestination.TELEGRAM.name)
+                    )
                     PendingForwardItem(
                         id = o.optString("id", ""),
                         channelLabel = o.optString("channelLabel", ""),
                         sourceTitle = o.optString("sourceTitle", ""),
                         formattedHtml = html,
+                        formattedPlainText = plain,
+                        targetDestinations = targets,
                         createdAtMs = o.optLong("createdAtMs", 0L),
                         attempts = o.optInt("attempts", 0)
                     )
@@ -189,6 +237,18 @@ class SmsSensePrefs(context: Context) {
             if (e.isJsonNull || !e.isJsonArray) return default
             return e.asJsonArray.mapNotNull { item ->
                 if (item.isJsonNull || !item.isJsonPrimitive) null else item.asString
+            }
+        }
+
+        private fun JsonObject.optIntList(key: String): List<Int> {
+            val e = get(key) ?: return emptyList()
+            if (e.isJsonNull || !e.isJsonArray) return emptyList()
+            return e.asJsonArray.mapNotNull { item ->
+                try {
+                    if (item.isJsonNull || !item.isJsonPrimitive) null else item.asInt
+                } catch (_: Exception) {
+                    null
+                }
             }
         }
     }

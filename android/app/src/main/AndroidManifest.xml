@@ -9,8 +9,9 @@
     <!-- 軌道 1：攔截實體簡訊 -->
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
 
-    <!-- 軌道 4：來電通知轉發（備用機未接／響鈴提醒） -->
+    <!-- 來電通知轉發與雙卡門號識別 -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
     <uses-permission android:name="android.permission.READ_CALL_LOG" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 

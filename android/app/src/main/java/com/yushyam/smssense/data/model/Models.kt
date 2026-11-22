@@ -1,46 +1,84 @@
 package com.yushyam.smssense.data.model
 
 /**
- * 轉發來源軌道列舉 (Capture Source Channel)
+ * 轉發來源列舉 (Capture Source Channel)
  */
 enum class SourceChannel(val labelZh: String, val badge: String) {
-    SMS("實體簡訊", "📩 簡訊"),
-    NOTIFICATION("白名單通知", "🔔 通知"),
+    SMS("簡訊轉發", "📩 簡訊"),
+    NOTIFICATION("應用通知", "🔔 通知"),
     FULLSCREEN_NOTIFICATION("全畫面通知", "⚡ 全畫面通知"),
-    LOGIN_PROMPT("登入確認彈窗", "🔐 登入彈窗"),
+    LOGIN_PROMPT("登入彈窗", "🔐 登入彈窗"),
     INCOMING_CALL("來電通知", "📞 來電"),
-    LOW_BATTERY("低電量警報", "🔋 低電量")
+    LOW_BATTERY("電量通知", "🔋 電量通知")
 }
 
 /**
- * 使用者配置與嚴格白名單規則 (Configuration & Whitelists)
+ * 推播目標通道列舉 (Forward Target Destination)
+ */
+enum class TargetDestination(val label: String) {
+    TELEGRAM("Telegram"),
+    LINE("LINE"),
+    WEBHOOK("Webhook")
+}
+
+/**
+ * 使用者設定與白名單規則 (Configuration & Whitelists)
  */
 data class SmsSenseConfig(
     val enabled: Boolean = true,
     val deviceAlias: String = "",
+    val offlineQueueEnabled: Boolean = true,
+    // Telegram Bot
+    val telegramEnabled: Boolean = true,
     val telegramBotToken: String = "",
     val telegramChatId: String = "",
-    // 軌道 1：簡訊預設「全文全部轉發」，絕不因過濾漏接
+    // LINE Messaging API
+    val lineEnabled: Boolean = false,
+    val lineChannelAccessToken: String = "",
+    val lineTargetId: String = "",
+    // 通用 Webhook
+    val webhookEnabled: Boolean = false,
+    val webhookUrl: String = "",
+    val webhookSecretHeader: String = "",
+    // 簡訊轉發
     val smsForwardEnabled: Boolean = true,
-    // 輔助功能：僅在頂部額外附加一行可點擊複製的驗證碼提示，永遠保留完整原文
     val appendOtpHint: Boolean = true,
-    // 軌道 2：App 通知（嚴格白名單制）
+    // 應用通知（白名單制）
     val notificationForwardEnabled: Boolean = true,
     val whitelistedNotifPackages: List<String> = emptyList(),
-    // 軌道 3：前景全畫面登入確認彈窗（嚴格白名單制 + 唯讀感知）
+    // 登入彈窗（白名單制）
     val promptForwardEnabled: Boolean = true,
     val whitelistedPromptPackages: List<String> = DEFAULT_PROMPT_PACKAGES,
-    // 軌道 4：來電通知轉發（接班備用機來電提醒）
+    // 來電通知
     val callForwardEnabled: Boolean = true,
-    // 軌道 5：備用機低電量警報（預設低於 20% 提醒，充回門檻 + 10% 重置防洗版）
+    // 電量通知（支援複選多個百分比門檻，例如同時勾選 30%、20%、15%）
     val lowBatteryAlertEnabled: Boolean = true,
-    val lowBatteryThreshold: Int = 20
+    val lowBatteryThresholds: List<Int> = DEFAULT_BATTERY_THRESHOLDS
 ) {
     val isTelegramConfigured: Boolean
-        get() = telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()
+        get() = telegramEnabled && telegramBotToken.isNotBlank() && telegramChatId.isNotBlank()
+
+    val isLineConfigured: Boolean
+        get() = lineEnabled && lineChannelAccessToken.isNotBlank() && lineTargetId.isNotBlank()
+
+    val isWebhookConfigured: Boolean
+        get() = webhookEnabled && (webhookUrl.startsWith("https://") || webhookUrl.startsWith("http://"))
+
+    val isAnyDestinationConfigured: Boolean
+        get() = isTelegramConfigured || isLineConfigured || isWebhookConfigured
+
+    fun activeDestinationLabels(): List<String> {
+        val list = mutableListOf<String>()
+        if (isTelegramConfigured) list.add("Telegram")
+        if (isLineConfigured) list.add("LINE")
+        if (isWebhookConfigured) list.add("Webhook")
+        return list
+    }
 
     companion object {
-        // 常見登入確認彈窗預設白名單（使用者可隨時增刪）
+        val DEFAULT_BATTERY_THRESHOLDS = listOf(20)
+        val AVAILABLE_BATTERY_THRESHOLDS = listOf(15, 20, 25, 30)
+
         val DEFAULT_PROMPT_PACKAGES = listOf(
             "com.google.android.gms",
             "com.azure.authenticator",
@@ -50,13 +88,14 @@ data class SmsSenseConfig(
 }
 
 /**
- * 單筆待評估之攔截事件 (Captured Forward Event)
+ * 單筆攔截事件 (Captured Forward Event)
  */
 data class ForwardEvent(
     val channel: SourceChannel,
     val packageName: String,
     val sourceTitle: String,
     val content: String,
+    val receiverSimInfo: String = "",
     val actionLabels: List<String> = emptyList(),
     val timestampMs: Long = System.currentTimeMillis()
 )
@@ -69,6 +108,8 @@ data class PendingForwardItem(
     val channelLabel: String,
     val sourceTitle: String,
     val formattedHtml: String,
+    val formattedPlainText: String = "",
+    val targetDestinations: List<String> = listOf(TargetDestination.TELEGRAM.name),
     val createdAtMs: Long,
     val attempts: Int = 0
 )
@@ -86,7 +127,7 @@ data class ForwardLogItem(
 )
 
 /**
- * 手機已安裝應用資訊（供白名單搜尋勾選使用）
+ * 已安裝應用資訊
  */
 data class InstalledAppInfo(
     val packageName: String,

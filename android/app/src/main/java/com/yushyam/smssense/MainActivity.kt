@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -36,6 +37,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -44,14 +46,17 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.yushyam.smssense.data.model.ForwardEvent
 import com.yushyam.smssense.data.model.ForwardLogItem
 import com.yushyam.smssense.data.model.InstalledAppInfo
 import com.yushyam.smssense.data.model.SmsSenseConfig
 import com.yushyam.smssense.data.model.SourceChannel
+import com.yushyam.smssense.data.model.TargetDestination
 import com.yushyam.smssense.data.repo.SmsSensePrefs
 import com.yushyam.smssense.engine.ForwardRuleEngine
-import com.yushyam.smssense.engine.TelegramSender
+import com.yushyam.smssense.engine.SimSlotResolver
 import com.yushyam.smssense.receiver.BatteryAlertReceiver
 import com.yushyam.smssense.service.ForwardDispatcher
 import com.yushyam.smssense.service.NotificationSenseService
@@ -63,7 +68,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-// 與 DnsSense 完全統一之 Shadcn Zinc 極簡中性色票
+// Shadcn/UI Zinc 極簡中性色票
 private object SmsPalette {
     val Bg = Color(0xFFFAFAFA)
     val Surface = Color(0xFFFFFFFF)
@@ -133,12 +138,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        ForwardDispatcher.notifyUi(this)
+    }
+
     private fun requestSmsPermissions() {
         val perms = mutableListOf(
             Manifest.permission.RECEIVE_SMS,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.READ_CALL_LOG
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            perms.add(Manifest.permission.READ_PHONE_NUMBERS)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -155,6 +168,7 @@ fun SmsSenseApp(
 ) {
     val scope = rememberCoroutineScope()
     val prefs = remember { SmsSensePrefs(context) }
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var selectedTab by remember { mutableStateOf(SmsTab.OVERVIEW) }
     var config by remember { mutableStateOf(prefs.loadConfig()) }
@@ -186,6 +200,19 @@ fun SmsSenseApp(
         withContext(Dispatchers.IO) {
             val loaded = loadInstalledApps(context)
             withContext(Dispatchers.Main) { installedApps = loaded }
+        }
+    }
+
+    // 監聽 Activity ON_RESUME：從系統權限設定頁返回時自動重刷狀態
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refreshState()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
         }
     }
 
@@ -227,7 +254,7 @@ fun SmsSenseApp(
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             Text("SmsSense", fontWeight = FontWeight.Bold, fontSize = 19.sp, color = SmsPalette.Ink)
-                            val ready = config.enabled && config.isTelegramConfigured
+                            val ready = config.enabled && config.isAnyDestinationConfigured
                             StatusPill(
                                 label = if (ready) "轉發中" else "待設定",
                                 bg = if (ready) SmsPalette.GreenBg else SmsPalette.AmberBg,
@@ -299,43 +326,64 @@ fun SmsSenseApp(
                         ForwardDispatcher.syncBatteryMonitor(context)
                     },
                     onSendTest = {
-                        if (!config.isTelegramConfigured) {
-                            onShowToast("請先到「設定」填寫 Telegram Bot Token 與 Chat ID")
+                        if (!config.isAnyDestinationConfigured) {
+                            onShowToast("請先到「設定」填寫推播通道資訊")
                             selectedTab = SmsTab.SETTINGS
                             return@OverviewTab
                         }
                         isSendingTest = true
                         scope.launch(Dispatchers.IO) {
+                            val detectedSim = SimSlotResolver.resolveSimDescription(context, Intent())
                             val testEvent = ForwardEvent(
                                 channel = SourceChannel.SMS,
                                 packageName = "sms",
                                 sourceTitle = "系統測試",
+                                receiverSimInfo = detectedSim,
                                 content = "【SmsSense】您的驗證碼是 829401，請於 5 分鐘內完成驗證。轉發通道連線正常。"
                             )
+                            val model = Build.MODEL.orEmpty()
                             val html = ForwardRuleEngine.formatTelegramHtml(
                                 config = config,
                                 event = testEvent,
-                                deviceModel = Build.MODEL.orEmpty()
+                                deviceModel = model
                             )
-                            val (ok, msg) = TelegramSender.sendHtmlMessage(
-                                config.telegramBotToken,
-                                config.telegramChatId,
-                                html
+                            val plain = ForwardRuleEngine.formatPlainText(
+                                config = config,
+                                event = testEvent,
+                                deviceModel = model
                             )
+                            val activeTargets = mutableListOf<TargetDestination>()
+                            if (config.isTelegramConfigured) activeTargets.add(TargetDestination.TELEGRAM)
+                            if (config.isLineConfigured) activeTargets.add(TargetDestination.LINE)
+                            if (config.isWebhookConfigured) activeTargets.add(TargetDestination.WEBHOOK)
+
+                            val results = ForwardDispatcher.sendToTargets(config, activeTargets, html, plain)
+                            val allOk = results.isNotEmpty() && results.all { it.second }
+                            val detail = results.joinToString(" | ") { "${it.first.label}: ${it.third}" }
+
                             prefs.appendLog(
                                 ForwardLogItem(
                                     timestampMs = System.currentTimeMillis(),
                                     channelLabel = "測試訊息",
-                                    sourceTitle = "Telegram Bot",
+                                    sourceTitle = activeTargets.joinToString("+") { it.label },
                                     preview = "測試連線推播",
-                                    delivered = ok,
-                                    statusDetail = msg
+                                    delivered = allOk,
+                                    statusDetail = detail
                                 )
                             )
                             withContext(Dispatchers.Main) {
                                 isSendingTest = false
                                 refreshState()
-                                onShowToast(if (ok) "測試訊息已送達 Telegram！" else msg)
+                                onShowToast(if (allOk) "測試訊息已送達（${activeTargets.joinToString { it.label }}）！" else detail)
+                            }
+                        }
+                    },
+                    onFlushPending = {
+                        scope.launch(Dispatchers.IO) {
+                            val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
+                            withContext(Dispatchers.Main) {
+                                refreshState()
+                                onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
                             }
                         }
                     },
@@ -377,11 +425,22 @@ fun SmsSenseApp(
                         config = next
                         ForwardDispatcher.syncBatteryMonitor(context)
                     },
-                    onChangeBatteryThreshold = { threshold ->
-                        val next = config.copy(lowBatteryThreshold = threshold)
+                    onToggleBatteryThreshold = { pct ->
+                        val current = config.lowBatteryThresholds.toMutableSet()
+                        if (pct in current) {
+                            if (current.size > 1) {
+                                current.remove(pct)
+                            } else {
+                                onShowToast("請至少保留一項電量通知門檻")
+                                return@WhitelistTab
+                            }
+                        } else {
+                            current.add(pct)
+                        }
+                        val next = config.copy(lowBatteryThresholds = current.sorted())
                         prefs.saveConfig(next)
-                        config = next
-                        prefs.setLowBatteryAlertSent(false)
+                        config = prefs.loadConfig()
+                        prefs.saveSentBatteryThresholds(emptySet())
                         ForwardDispatcher.syncBatteryMonitor(context)
                     },
                     onAddNotifApp = { pickerTarget = WhitelistTarget.NOTIF },
@@ -404,17 +463,34 @@ fun SmsSenseApp(
                     hasCallPerm = hasCallPerm,
                     hasNotifPerm = hasNotifPerm,
                     hasPromptPerm = hasPromptPerm,
-                    onSaveTelegram = { alias, token, chatId ->
-                        val next = config.copy(
-                            deviceAlias = alias,
-                            telegramBotToken = token,
-                            telegramChatId = chatId
-                        )
-                        prefs.saveConfig(next)
-                        config = next
-                        onShowToast("已儲存 Telegram 設定")
+                    pendingCount = pendingCount,
+                    onSaveConfig = { updated ->
+                        prefs.saveConfig(updated)
+                        config = prefs.loadConfig()
+                        onShowToast("設定已儲存")
+                    },
+                    onFlushPending = {
+                        scope.launch(Dispatchers.IO) {
+                            val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
+                            withContext(Dispatchers.Main) {
+                                refreshState()
+                                onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
+                            }
+                        }
+                    },
+                    onClearPending = {
+                        prefs.clearPendingQueue()
+                        refreshState()
+                        onShowToast("已清空待補發佇列")
                     },
                     onRequestSmsPerm = onRequestSmsPermission,
+                    onOpenAppDetails = {
+                        val intent = Intent(
+                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", context.packageName, null)
+                        )
+                        context.startActivity(intent)
+                    },
                     onOpenNotifSettings = {
                         context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                     },
@@ -445,13 +521,12 @@ fun SmsSenseApp(
         }
     }
 
-    // 已安裝 App 搜尋勾選對話框（供通知白名單 / 彈窗白名單共用）
     pickerTarget?.let { target ->
         val existing = if (target == WhitelistTarget.NOTIF) config.whitelistedNotifPackages
         else config.whitelistedPromptPackages
 
         AppPickerDialog(
-            title = if (target == WhitelistTarget.NOTIF) "選擇通知轉發白名單 App" else "選擇全畫面登入彈窗監聽 App",
+            title = if (target == WhitelistTarget.NOTIF) "選擇應用通知白名單" else "選擇登入彈窗白名單",
             installedApps = installedApps,
             selectedPackages = existing.toSet(),
             onDismiss = { pickerTarget = null },
@@ -470,7 +545,7 @@ fun SmsSenseApp(
 }
 
 // =====================================================================
-// Tab 1: 總覽
+// Tab 1: 總覽（統一 4 字標籤、無括號冗言）
 // =====================================================================
 @Composable
 private fun OverviewTab(
@@ -484,9 +559,13 @@ private fun OverviewTab(
     isSendingTest: Boolean,
     onToggleEnabled: (Boolean) -> Unit,
     onSendTest: () -> Unit,
+    onFlushPending: () -> Unit,
     onGoSettings: () -> Unit,
     onGoWhitelist: () -> Unit
 ) {
+    val activeLabels = config.activeDestinationLabels()
+    val thresholdText = config.lowBatteryThresholds.sorted().joinToString("/") { "$it%" }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -501,19 +580,24 @@ private fun OverviewTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("Telegram 單向轉發引擎", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                        Text(
+                            if (activeLabels.isEmpty()) "推播通道未設定"
+                            else "通道：${activeLabels.joinToString(" · ")}",
+                            fontSize = 12.sp,
+                            color = SmsPalette.InkMuted
+                        )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            if (config.enabled) "守護運作中" else "已暫停轉發",
-                            fontSize = 26.sp,
+                            if (config.enabled) "轉發運作中" else "已暫停轉發",
+                            fontSize = 24.sp,
                             fontWeight = FontWeight.Bold,
                             color = SmsPalette.Ink
                         )
                         Text(
                             when {
-                                !config.isTelegramConfigured -> "尚未設定 Bot Token 與 Chat ID"
+                                !config.isAnyDestinationConfigured -> "請前往「設定」配置推播通道"
                                 config.deviceAlias.isNotBlank() -> "${config.deviceAlias} (${Build.MODEL})"
-                                else -> "裝置型號：${Build.MODEL}"
+                                else -> Build.MODEL
                             },
                             fontSize = 13.sp,
                             color = SmsPalette.InkMuted
@@ -524,35 +608,75 @@ private fun OverviewTab(
             }
         }
 
-        // 五軌狀態 Bento 卡
+        // 監控狀態卡（全部嚴格 4 字對齊）
         item {
             CraftCard {
-                Text("事件感知與備用機守護狀態", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = SmsPalette.Ink)
+                Text("監控狀態", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = SmsPalette.Ink)
                 Spacer(Modifier.height(10.dp))
-                ChannelStatusRow("實體簡訊全文", config.smsForwardEnabled && hasSmsPerm, if (hasSmsPerm) "已授權" else "缺簡訊權限")
-                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
+
                 ChannelStatusRow(
-                    "白名單通知與全畫面通知",
-                    config.notificationForwardEnabled && hasNotifPerm,
-                    if (hasNotifPerm) "已監聽 ${config.whitelistedNotifPackages.size} 款" else "未開通知存取"
+                    title = "簡訊轉發",
+                    active = config.smsForwardEnabled && hasSmsPerm,
+                    badgeText = when {
+                        !config.smsForwardEnabled -> "已停用"
+                        hasSmsPerm -> "已就緒"
+                        else -> "未授權"
+                    }
                 )
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
+
                 ChannelStatusRow(
-                    "登入確認彈窗（唯讀）",
-                    config.promptForwardEnabled && hasPromptPerm,
-                    if (hasPromptPerm) "已監聽 ${config.whitelistedPromptPackages.size} 款" else "未開唯讀無障礙"
+                    title = "來電通知",
+                    active = config.callForwardEnabled && hasCallPerm,
+                    badgeText = when {
+                        !config.callForwardEnabled -> "已停用"
+                        hasCallPerm -> "已就緒"
+                        else -> "未授權"
+                    }
                 )
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
+
                 ChannelStatusRow(
-                    "來電響鈴通知",
-                    config.callForwardEnabled && hasCallPerm,
-                    if (hasCallPerm) "已授權" else "缺通話權限"
+                    title = "應用通知",
+                    active = config.notificationForwardEnabled && hasNotifPerm,
+                    badgeText = when {
+                        !config.notificationForwardEnabled -> "已停用"
+                        hasNotifPerm -> "${config.whitelistedNotifPackages.size} 款應用"
+                        else -> "未授權"
+                    }
                 )
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
+
                 ChannelStatusRow(
-                    "低電量警報（門檻 ${config.lowBatteryThreshold}%）",
-                    config.lowBatteryAlertEnabled,
-                    if (batteryPercent >= 0) "目前 $batteryPercent%" else "已啟用"
+                    title = "登入彈窗",
+                    active = config.promptForwardEnabled && hasPromptPerm,
+                    badgeText = when {
+                        !config.promptForwardEnabled -> "已停用"
+                        hasPromptPerm -> "${config.whitelistedPromptPackages.size} 款應用"
+                        else -> "未開啟"
+                    }
+                )
+                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
+
+                ChannelStatusRow(
+                    title = "電量通知",
+                    active = config.lowBatteryAlertEnabled,
+                    badgeText = when {
+                        !config.lowBatteryAlertEnabled -> "已停用"
+                        batteryPercent >= 0 -> "$thresholdText · 目前 $batteryPercent%"
+                        else -> thresholdText
+                    }
+                )
+                HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
+
+                ChannelStatusRow(
+                    title = "斷網補發",
+                    active = config.offlineQueueEnabled,
+                    badgeText = when {
+                        !config.offlineQueueEnabled -> "已停用"
+                        pendingCount > 0 -> "待送 $pendingCount 筆"
+                        else -> "已就緒"
+                    }
                 )
             }
         }
@@ -569,7 +693,7 @@ private fun OverviewTab(
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text(if (isSendingTest) "發送中..." else "測試 Telegram")
+                    Text(if (isSendingTest) "發送中..." else "發送測試")
                 }
                 OutlinedButton(
                     onClick = onGoWhitelist,
@@ -590,18 +714,26 @@ private fun OverviewTab(
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Text(
-                            "目前有 $pendingCount 筆離線待補發訊息，網路恢復後將自動補送至 Telegram。",
+                            "尚有 $pendingCount 筆離線訊息待補發，連網後將自動送出。",
                             fontSize = 13.sp,
-                            color = SmsPalette.AmberFg
+                            color = SmsPalette.AmberFg,
+                            modifier = Modifier.weight(1f)
                         )
+                        TextButton(onClick = onFlushPending) {
+                            Text("立即補發", fontWeight = FontWeight.Bold, color = SmsPalette.AmberFg)
+                        }
                     }
                 }
             }
         }
 
-        if (!config.isTelegramConfigured || !hasSmsPerm || !hasNotifPerm) {
+        if (!config.isAnyDestinationConfigured || !hasSmsPerm || !hasNotifPerm) {
             item {
                 Surface(
                     modifier = Modifier
@@ -618,8 +750,8 @@ private fun OverviewTab(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text("尚有初始設定或權限未完成", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = SmsPalette.AmberFg)
-                            Text("前往「設定」填入 Telegram 資訊並開啟必要權限。", fontSize = 12.sp, color = Color(0xFF92400E))
+                            Text("尚有設定或權限未完成", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = SmsPalette.AmberFg)
+                            Text("點擊前往「設定」配置通道或開啟權限。", fontSize = 12.sp, color = Color(0xFF92400E))
                         }
                         Icon(Icons.Default.ChevronRight, contentDescription = null, tint = SmsPalette.AmberFg)
                     }
@@ -636,7 +768,7 @@ private fun ChannelStatusRow(title: String, active: Boolean, badgeText: String) 
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = SmsPalette.Ink, modifier = Modifier.weight(1f))
+        Text(title, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = SmsPalette.Ink, modifier = Modifier.weight(1f))
         StatusPill(
             label = badgeText,
             bg = if (active) SmsPalette.GreenBg else SmsPalette.Subtle,
@@ -647,7 +779,7 @@ private fun ChannelStatusRow(title: String, active: Boolean, badgeText: String) 
 }
 
 // =====================================================================
-// Tab 2: 白名單（簡訊全文設定 + 通知白名單 + 彈窗白名單）
+// Tab 2: 白名單（簡訊、來電、電量通知複選、應用與彈窗白名單）
 // =====================================================================
 @Composable
 private fun WhitelistTab(
@@ -659,7 +791,7 @@ private fun WhitelistTab(
     onTogglePrompt: (Boolean) -> Unit,
     onToggleCall: (Boolean) -> Unit,
     onToggleLowBattery: (Boolean) -> Unit,
-    onChangeBatteryThreshold: (Int) -> Unit,
+    onToggleBatteryThreshold: (Int) -> Unit,
     onAddNotifApp: () -> Unit,
     onRemoveNotifApp: (String) -> Unit,
     onAddPromptApp: () -> Unit,
@@ -670,10 +802,10 @@ private fun WhitelistTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 14.dp)
     ) {
-        // 簡訊全文轉發卡
+        // 簡訊與來電設定
         item {
             CraftCard {
-                Text("實體簡訊轉發（原文完整保留）", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                Text("簡訊與來電", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
                 Spacer(Modifier.height(8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -681,8 +813,8 @@ private fun WhitelistTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("轉發所有簡訊原文", fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                        Text("保留完整上下文，自行判讀不怕截錯", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                        Text("簡訊轉發", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text("保留完整原文，並標註系統 SIM 卡槽與發生時間", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                     Switch(checked = config.smsForwardEnabled, onCheckedChange = onToggleSms)
                 }
@@ -693,113 +825,10 @@ private fun WhitelistTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("頂部附加驗證碼快捷複製", fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                        Text("偵測到驗證碼時置頂附一行單擊複製，原文仍完整保留", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                        Text("置頂顯示驗證碼", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text("偵測到驗證碼時於頂部附一行單擊複製", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                     Switch(checked = config.appendOtpHint, onCheckedChange = onToggleOtpHint)
-                }
-            }
-        }
-
-        // App 通知白名單卡
-        item {
-            CraftCard {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("App 通知白名單（含全畫面通知）", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
-                        Text("僅轉發下方勾選的 App，杜絕無用通知洗版", fontSize = 12.sp, color = SmsPalette.InkMuted)
-                    }
-                    Switch(checked = config.notificationForwardEnabled, onCheckedChange = onToggleNotif)
-                }
-                Spacer(Modifier.height(10.dp))
-                Button(
-                    onClick = onAddNotifApp,
-                    modifier = Modifier.fillMaxWidth().height(42.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = SmsPalette.InkPrimary)
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("從已安裝 App 勾選通知白名單")
-                }
-                Spacer(Modifier.height(10.dp))
-                if (config.whitelistedNotifPackages.isEmpty()) {
-                    Text("尚未勾選任何 App（目前不會轉發一般 App 通知）", fontSize = 12.sp, color = SmsPalette.InkMuted)
-                } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        config.whitelistedNotifPackages.forEach { pkg ->
-                            PackageRow(
-                                label = appLabelMap[pkg] ?: pkg,
-                                packageName = pkg,
-                                onRemove = { onRemoveNotifApp(pkg) }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // 前景登入確認彈窗白名單卡
-        item {
-            CraftCard {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("全畫面登入彈窗白名單（唯讀）", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
-                        Text("偵測 Google 提示／Authenticator／銀行驗證視窗跳出", fontSize = 12.sp, color = SmsPalette.InkMuted)
-                    }
-                    Switch(checked = config.promptForwardEnabled, onCheckedChange = onTogglePrompt)
-                }
-                Spacer(Modifier.height(10.dp))
-                OutlinedButton(
-                    onClick = onAddPromptApp,
-                    modifier = Modifier.fillMaxWidth().height(42.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, SmsPalette.Border)
-                ) {
-                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp), tint = SmsPalette.InkPrimary)
-                    Spacer(Modifier.width(6.dp))
-                    Text("從已安裝 App 新增彈窗監聽", color = SmsPalette.InkPrimary)
-                }
-                Spacer(Modifier.height(10.dp))
-                if (config.whitelistedPromptPackages.isEmpty()) {
-                    Text("尚未加入任何登入彈窗監聽 App", fontSize = 12.sp, color = SmsPalette.InkMuted)
-                } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        config.whitelistedPromptPackages.forEach { pkg ->
-                            PackageRow(
-                                label = appLabelMap[pkg] ?: pkg,
-                                packageName = pkg,
-                                onRemove = { onRemovePromptApp(pkg) }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // 備用機延伸守護：來電通知與低電量警報
-        item {
-            CraftCard {
-                Text("備用機守護（來電與低電量）", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("來電響鈴通知", fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                        Text("備用機響鈴時立即將來電號碼送到 Telegram", fontSize = 12.sp, color = SmsPalette.InkMuted)
-                    }
-                    Switch(checked = config.callForwardEnabled, onCheckedChange = onToggleCall)
                 }
                 HorizontalDivider(Modifier.padding(vertical = 8.dp), color = SmsPalette.Border)
                 Row(
@@ -808,21 +837,38 @@ private fun WhitelistTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("低電量充電提醒", fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                        Text("低於設定門檻提醒一次，充回門檻 +10% 才重置防洗版", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                        Text("來電通知", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text("響鈴時推播來電號碼與收受 SIM 卡槽", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                    }
+                    Switch(checked = config.callForwardEnabled, onCheckedChange = onToggleCall)
+                }
+            }
+        }
+
+        // 電量通知（支援複選多個百分比門檻）
+        item {
+            CraftCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("電量通知", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                        Text("可複選多個通知門檻，電量依序跌破時各提醒一次", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                     Switch(checked = config.lowBatteryAlertEnabled, onCheckedChange = onToggleLowBattery)
                 }
                 if (config.lowBatteryAlertEnabled) {
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        listOf(15, 20, 25, 30).forEach { pct ->
-                            val selected = config.lowBatteryThreshold == pct
+                        SmsSenseConfig.AVAILABLE_BATTERY_THRESHOLDS.forEach { pct ->
+                            val selected = pct in config.lowBatteryThresholds
                             Surface(
                                 modifier = Modifier
                                     .weight(1f)
                                     .clip(RoundedCornerShape(8.dp))
-                                    .clickable { onChangeBatteryThreshold(pct) },
+                                    .clickable { onToggleBatteryThreshold(pct) },
                                 color = if (selected) SmsPalette.InkPrimary else SmsPalette.Subtle,
                                 border = BorderStroke(1.dp, if (selected) SmsPalette.InkPrimary else SmsPalette.Border),
                                 shape = RoundedCornerShape(8.dp)
@@ -839,6 +885,90 @@ private fun WhitelistTab(
                                     )
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 應用通知白名單
+        item {
+            CraftCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("應用通知白名單", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                        Text("僅轉發下方勾選的 App 通知", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                    }
+                    Switch(checked = config.notificationForwardEnabled, onCheckedChange = onToggleNotif)
+                }
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = onAddNotifApp,
+                    modifier = Modifier.fillMaxWidth().height(42.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = SmsPalette.InkPrimary)
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("勾選通知白名單 App")
+                }
+                Spacer(Modifier.height(10.dp))
+                if (config.whitelistedNotifPackages.isEmpty()) {
+                    Text("尚未勾選任何 App", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        config.whitelistedNotifPackages.forEach { pkg ->
+                            PackageRow(
+                                label = appLabelMap[pkg] ?: pkg,
+                                packageName = pkg,
+                                onRemove = { onRemoveNotifApp(pkg) }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 登入彈窗白名單
+        item {
+            CraftCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("登入彈窗白名單", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                        Text("偵測 Google 提示／Authenticator 登入確認視窗", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                    }
+                    Switch(checked = config.promptForwardEnabled, onCheckedChange = onTogglePrompt)
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = onAddPromptApp,
+                    modifier = Modifier.fillMaxWidth().height(42.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, SmsPalette.Border)
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp), tint = SmsPalette.InkPrimary)
+                    Spacer(Modifier.width(6.dp))
+                    Text("勾選彈窗監聽 App", color = SmsPalette.InkPrimary)
+                }
+                Spacer(Modifier.height(10.dp))
+                if (config.whitelistedPromptPackages.isEmpty()) {
+                    Text("尚未加入任何 App", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        config.whitelistedPromptPackages.forEach { pkg ->
+                            PackageRow(
+                                label = appLabelMap[pkg] ?: pkg,
+                                packageName = pkg,
+                                onRemove = { onRemovePromptApp(pkg) }
+                            )
                         }
                     }
                 }
@@ -868,7 +998,7 @@ private fun PackageRow(label: String, packageName: String, onRemove: () -> Unit)
 }
 
 // =====================================================================
-// Tab 3: 設定（Telegram Bot + 三軌系統權限）
+// Tab 3: 設定（Shadcn Segmented Tabs 推播通道切換 + 系統權限與斷網設定）
 // =====================================================================
 @Composable
 private fun SettingsTab(
@@ -877,74 +1007,354 @@ private fun SettingsTab(
     hasCallPerm: Boolean,
     hasNotifPerm: Boolean,
     hasPromptPerm: Boolean,
-    onSaveTelegram: (String, String, String) -> Unit,
+    pendingCount: Int,
+    onSaveConfig: (SmsSenseConfig) -> Unit,
+    onFlushPending: () -> Unit,
+    onClearPending: () -> Unit,
     onRequestSmsPerm: () -> Unit,
+    onOpenAppDetails: () -> Unit,
     onOpenNotifSettings: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit
 ) {
     var alias by remember(config.deviceAlias) { mutableStateOf(config.deviceAlias) }
-    var token by remember(config.telegramBotToken) { mutableStateOf(config.telegramBotToken) }
-    var chatId by remember(config.telegramChatId) { mutableStateOf(config.telegramChatId) }
-    var showToken by remember { mutableStateOf(false) }
+    var offlineQueueEnabled by remember(config.offlineQueueEnabled) { mutableStateOf(config.offlineQueueEnabled) }
+
+    var selectedChannelTab by remember { mutableStateOf(TargetDestination.TELEGRAM) }
+
+    var tgEnabled by remember(config.telegramEnabled) { mutableStateOf(config.telegramEnabled) }
+    var tgToken by remember(config.telegramBotToken) { mutableStateOf(config.telegramBotToken) }
+    var tgChatId by remember(config.telegramChatId) { mutableStateOf(config.telegramChatId) }
+    var showTgToken by remember { mutableStateOf(false) }
+
+    var lineEnabled by remember(config.lineEnabled) { mutableStateOf(config.lineEnabled) }
+    var lineToken by remember(config.lineChannelAccessToken) { mutableStateOf(config.lineChannelAccessToken) }
+    var lineTarget by remember(config.lineTargetId) { mutableStateOf(config.lineTargetId) }
+    var showLineToken by remember { mutableStateOf(false) }
+
+    var webhookEnabled by remember(config.webhookEnabled) { mutableStateOf(config.webhookEnabled) }
+    var webhookUrl by remember(config.webhookUrl) { mutableStateOf(config.webhookUrl) }
+    var webhookSecret by remember(config.webhookSecretHeader) { mutableStateOf(config.webhookSecretHeader) }
+    var showWebhookSecret by remember { mutableStateOf(false) }
+
+    fun buildDraftConfig(): SmsSenseConfig {
+        return config.copy(
+            deviceAlias = alias,
+            offlineQueueEnabled = offlineQueueEnabled,
+            telegramEnabled = tgEnabled,
+            telegramBotToken = tgToken,
+            telegramChatId = tgChatId,
+            lineEnabled = lineEnabled,
+            lineChannelAccessToken = lineToken,
+            lineTargetId = lineTarget,
+            webhookEnabled = webhookEnabled,
+            webhookUrl = webhookUrl,
+            webhookSecretHeader = webhookSecret
+        )
+    }
+
+    val draft = buildDraftConfig()
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 14.dp)
     ) {
+        // 1. 推播通道（Shadcn Segmented Control 膠囊切換器）
         item {
             CraftCard {
-                Text("Telegram 推播設定", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("推播通道", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                    Text(
+                        "可同時啟用多軌並行",
+                        fontSize = 12.sp,
+                        color = SmsPalette.InkMuted
+                    )
+                }
+
                 Spacer(Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SmsPalette.Subtle, RoundedCornerShape(10.dp))
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    TargetDestination.entries.forEach { dest ->
+                        val isSelected = selectedChannelTab == dest
+                        val isConfigured = when (dest) {
+                            TargetDestination.TELEGRAM -> draft.isTelegramConfigured
+                            TargetDestination.LINE -> draft.isLineConfigured
+                            TargetDestination.WEBHOOK -> draft.isWebhookConfigured
+                        }
+                        val isSwitchOn = when (dest) {
+                            TargetDestination.TELEGRAM -> tgEnabled
+                            TargetDestination.LINE -> lineEnabled
+                            TargetDestination.WEBHOOK -> webhookEnabled
+                        }
+                        val dotColor = when {
+                            isConfigured -> SmsPalette.GreenFg
+                            isSwitchOn -> SmsPalette.AmberFg
+                            else -> SmsPalette.InkFaint
+                        }
+
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(7.dp))
+                                .clickable { selectedChannelTab = dest },
+                            color = if (isSelected) SmsPalette.Surface else Color.Transparent,
+                            border = if (isSelected) BorderStroke(1.dp, SmsPalette.Border) else null,
+                            shape = RoundedCornerShape(7.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(vertical = 8.dp, horizontal = 6.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .background(dotColor, CircleShape)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = dest.label,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                    color = if (isSelected) SmsPalette.Ink else SmsPalette.InkMuted
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                when (selectedChannelTab) {
+                    TargetDestination.TELEGRAM -> {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("啟用 Telegram 推播", fontWeight = FontWeight.Medium, fontSize = 14.sp, color = SmsPalette.Ink)
+                                Text("透過 Telegram Bot 傳送 HTML 格式訊息", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                            }
+                            Switch(checked = tgEnabled, onCheckedChange = { tgEnabled = it })
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = tgToken,
+                            onValueChange = { tgToken = it },
+                            label = { Text("Bot Token（由 @BotFather 取得）") },
+                            singleLine = true,
+                            visualTransformation = if (showTgToken) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { showTgToken = !showTgToken }) {
+                                    Icon(if (showTgToken) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = "切換顯示")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = tgChatId,
+                            onValueChange = { tgChatId = it },
+                            label = { Text("Chat ID（接收者或群組 ID）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    TargetDestination.LINE -> {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("啟用 LINE 推播", fontWeight = FontWeight.Medium, fontSize = 14.sp, color = SmsPalette.Ink)
+                                Text("透過 LINE Messaging API 推播至個人或群組", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                            }
+                            Switch(checked = lineEnabled, onCheckedChange = { lineEnabled = it })
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = lineToken,
+                            onValueChange = { lineToken = it },
+                            label = { Text("Channel Access Token") },
+                            singleLine = true,
+                            visualTransformation = if (showLineToken) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { showLineToken = !showLineToken }) {
+                                    Icon(if (showLineToken) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = "切換顯示")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = lineTarget,
+                            onValueChange = { lineTarget = it },
+                            label = { Text("Target ID（User ID 或 Group ID）") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+
+                    TargetDestination.WEBHOOK -> {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("啟用 Webhook 推播", fontWeight = FontWeight.Medium, fontSize = 14.sp, color = SmsPalette.Ink)
+                                Text("相容 Discord / Slack / n8n / 自建 HTTP POST", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                            }
+                            Switch(checked = webhookEnabled, onCheckedChange = { webhookEnabled = it })
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = webhookUrl,
+                            onValueChange = { webhookUrl = it },
+                            label = { Text("Webhook URL (https://...)") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = webhookSecret,
+                            onValueChange = { webhookSecret = it },
+                            label = { Text("Secret Header / Bearer Token（選填）") },
+                            singleLine = true,
+                            visualTransformation = if (showWebhookSecret) VisualTransformation.None else PasswordVisualTransformation(),
+                            trailingIcon = {
+                                IconButton(onClick = { showWebhookSecret = !showWebhookSecret }) {
+                                    Icon(if (showWebhookSecret) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = "切換顯示")
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+
+                HorizontalDivider(Modifier.padding(vertical = 12.dp), color = SmsPalette.Border)
+
                 OutlinedTextField(
                     value = alias,
                     onValueChange = { alias = it },
-                    label = { Text("裝置別名（選填，例如：備用機 S22）") },
+                    label = { Text("裝置別名（選填，留空則顯示系統型號）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = token,
-                    onValueChange = { token = it },
-                    label = { Text("Bot Token（由 @BotFather 取得）") },
-                    singleLine = true,
-                    visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailingIcon = {
-                        IconButton(onClick = { showToken = !showToken }) {
-                            Icon(if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility, contentDescription = "切換顯示")
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = chatId,
-                    onValueChange = { chatId = it },
-                    label = { Text("Chat ID（接收者或群組 ID）") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+
                 Spacer(Modifier.height(12.dp))
+
                 Button(
-                    onClick = { onSaveTelegram(alias, token, chatId) },
+                    onClick = { onSaveConfig(buildDraftConfig()) },
                     modifier = Modifier.fillMaxWidth().height(44.dp),
                     shape = RoundedCornerShape(10.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = SmsPalette.InkPrimary)
                 ) {
-                    Text("儲存 Telegram 設定")
+                    Text("儲存設定", fontWeight = FontWeight.SemiBold)
                 }
             }
         }
 
+        // 2. 斷網補發佇列設定
         item {
             CraftCard {
-                Text("系統權限中心（免 Root / 免 Shizuku）", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("斷網自動佇列補發", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                        Text(
+                            "無網路時自動暫存原始發生時間與收受門號，待恢復連線後由系統背景自動補送。",
+                            fontSize = 12.sp,
+                            color = SmsPalette.InkMuted
+                        )
+                    }
+                    Switch(
+                        checked = offlineQueueEnabled,
+                        onCheckedChange = {
+                            offlineQueueEnabled = it
+                            onSaveConfig(buildDraftConfig().copy(offlineQueueEnabled = it))
+                        }
+                    )
+                }
+                if (pendingCount > 0) {
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = onFlushPending,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("立即補發 ($pendingCount 筆)", fontSize = 12.sp)
+                        }
+                        OutlinedButton(
+                            onClick = onClearPending,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("清空佇列", fontSize = 12.sp, color = SmsPalette.RedFg)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 系統權限中心（附帶受限制設定一鍵跳轉）
+        item {
+            CraftCard {
+                Text("系統權限中心", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
                 Spacer(Modifier.height(10.dp))
 
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && (!hasNotifPerm || !hasPromptPerm)) {
+                    Surface(
+                        color = SmsPalette.AmberBg,
+                        border = BorderStroke(1.dp, SmsPalette.AmberBorder),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(
+                                "權限選項反灰無法開啟？",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = SmsPalette.AmberFg
+                            )
+                            Text(
+                                "Android 13+ / 小米系統需先開啟「應用程式資訊」➔ 點右上角「⋮」或滑至底部勾選「允許受限制的設定」，返回即可正常開啟。",
+                                fontSize = 12.sp,
+                                color = Color(0xFF92400E)
+                            )
+                            OutlinedButton(
+                                onClick = onOpenAppDetails,
+                                modifier = Modifier.fillMaxWidth().height(38.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, SmsPalette.AmberFg)
+                            ) {
+                                Text("開啟應用程式資訊（解鎖受限制設定）", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = SmsPalette.AmberFg)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+
                 PermissionRow(
-                    title = "1. 簡訊與來電權限 (SMS / Call)",
-                    subtitle = "攔截實體簡訊原文與來電號碼提醒",
+                    title = "1. 簡訊與電話權限",
+                    subtitle = "讀取簡訊、來電號碼與系統雙卡 SIM 資訊",
                     granted = hasSmsPerm && hasCallPerm,
                     actionLabel = "授予",
                     onAction = onRequestSmsPerm
@@ -952,15 +1362,15 @@ private fun SettingsTab(
                 HorizontalDivider(Modifier.padding(vertical = 10.dp), color = SmsPalette.Border)
                 PermissionRow(
                     title = "2. 通知存取權限",
-                    subtitle = "監聽白名單 App 通知與全畫面通知",
+                    subtitle = "讀取白名單 App 通知",
                     granted = hasNotifPerm,
                     actionLabel = "前往開啟",
                     onAction = onOpenNotifSettings
                 )
                 HorizontalDivider(Modifier.padding(vertical = 10.dp), color = SmsPalette.Border)
                 PermissionRow(
-                    title = "3. 無障礙唯讀彈窗感知（選配）",
-                    subtitle = "偵測 Google／銀行全畫面同意登入視窗（嚴格唯讀，無點擊能力）",
+                    title = "3. 無障礙視窗偵測（選配）",
+                    subtitle = "偵測 Google／銀行全畫面登入確認彈窗",
                     granted = hasPromptPerm,
                     actionLabel = "前往開啟",
                     onAction = onOpenAccessibilitySettings
@@ -1008,7 +1418,7 @@ private fun LogsTab(
     onFlushPending: () -> Unit,
     onClearLogs: () -> Unit
 ) {
-    val fmt = remember { SimpleDateFormat("MM/dd HH:mm:ss", Locale.getDefault()) }
+    val fmt = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
@@ -1047,7 +1457,7 @@ private fun LogsTab(
                     ) {
                         Icon(Icons.Default.History, contentDescription = null, tint = SmsPalette.InkFaint, modifier = Modifier.size(36.dp))
                         Text("尚無轉發紀錄", fontWeight = FontWeight.SemiBold, color = SmsPalette.Ink)
-                        Text("收到簡訊、白名單通知或登入確認彈窗後，會顯示於此。", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                        Text("收到簡訊、來電、白名單通知或登入彈窗後，會顯示於此。", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                 }
             }
@@ -1059,7 +1469,11 @@ private fun LogsTab(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
                             StatusPill(
                                 label = item.channelLabel,
                                 bg = if (item.delivered) SmsPalette.GreenBg else SmsPalette.AmberBg,
@@ -1068,6 +1482,7 @@ private fun LogsTab(
                             )
                             Text(item.sourceTitle, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, color = SmsPalette.Ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
+                        Spacer(Modifier.width(6.dp))
                         Text(fmt.format(Date(item.timestampMs)), fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = SmsPalette.InkMuted)
                     }
                     Spacer(Modifier.height(6.dp))

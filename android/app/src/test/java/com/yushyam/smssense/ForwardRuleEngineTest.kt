@@ -6,6 +6,7 @@ import com.yushyam.smssense.data.model.SourceChannel
 import com.yushyam.smssense.data.repo.SmsSensePrefs
 import com.yushyam.smssense.engine.ForwardRuleEngine
 import com.yushyam.smssense.engine.OtpExtractor
+import com.yushyam.smssense.engine.SimSlotResolver
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -14,13 +15,14 @@ import org.junit.Before
 import org.junit.Test
 
 /**
- * SmsSense 核心過濾白名單、語境 OTP 提取、防死循環與安全格式化單元測試
+ * SmsSense 核心過濾白名單、系統雙卡格式、多方推播通道、複選電量通知門檻與安全格式化單元測試
  */
 class ForwardRuleEngineTest {
 
     private val baseConfig = SmsSenseConfig(
         enabled = true,
-        deviceAlias = "備用機 S22",
+        deviceAlias = "TestPhone",
+        telegramEnabled = true,
         telegramBotToken = "123456:TEST_TOKEN",
         telegramChatId = "987654321",
         smsForwardEnabled = true,
@@ -46,20 +48,68 @@ class ForwardRuleEngineTest {
     }
 
     @Test
-    fun smsForwardsFullOriginalTextPlusOptionalOtpHint() {
+    fun smsForwardsFullOriginalTextPlusSystemDualSimSlotAndOtpHint() {
+        val fullSim = SimSlotResolver.formatSimSummary(
+            slotIndex = 0,
+            carrierName = "中華電信",
+            phoneNumber = "0900000000",
+            subId = 1
+        )
+        assertEquals("SIM1_中華電信_0900000000 (SubId: 1)", fullSim)
+
+        val slotOnlySim = SimSlotResolver.formatSimSummary(
+            slotIndex = 1,
+            carrierName = "",
+            phoneNumber = "",
+            subId = -1
+        )
+        assertEquals("SIM2", slotOnlySim)
+
         val sms = ForwardEvent(
             channel = SourceChannel.SMS,
             packageName = "sms",
-            sourceTitle = "0912345678",
+            sourceTitle = "0900111222",
+            receiverSimInfo = slotOnlySim,
             content = "您的驗證碼為 583920，請勿告訴他人 <script>test</script>"
         )
         assertTrue(ForwardRuleEngine.shouldForward(baseConfig, sms))
 
         val html = ForwardRuleEngine.formatTelegramHtml(baseConfig, sms)
         assertTrue(html.contains("🔑 驗證碼：<code>583920</code>"))
+        assertTrue(html.contains("來源：<b>0900111222</b>"))
+        assertTrue(html.contains("收受：<b>SIM2</b>"))
         assertTrue(html.contains("您的驗證碼為 583920"))
         assertTrue(html.contains("&lt;script&gt;test&lt;/script&gt;"))
-        assertTrue(html.contains("[備用機 S22]"))
+        assertTrue(html.contains("[TestPhone]"))
+
+        val plain = ForwardRuleEngine.formatPlainText(baseConfig, sms)
+        assertTrue(plain.contains("來源：0900111222"))
+        assertTrue(plain.contains("收受：SIM2"))
+        assertTrue(plain.contains("🔑 驗證碼：583920"))
+    }
+
+    @Test
+    fun multiDestinationAllowsLineOrWebhookWithoutTelegram() {
+        val webhookOnlyConfig = SmsSenseConfig(
+            enabled = true,
+            telegramEnabled = false,
+            webhookEnabled = true,
+            webhookUrl = "https://discord.com/api/webhooks/123/abc"
+        )
+        val sms = ForwardEvent(SourceChannel.SMS, "sms", "12345", "系統通知")
+        assertTrue(webhookOnlyConfig.isWebhookConfigured)
+        assertTrue(webhookOnlyConfig.isAnyDestinationConfigured)
+        assertTrue(ForwardRuleEngine.shouldForward(webhookOnlyConfig, sms))
+
+        val lineOnlyConfig = SmsSenseConfig(
+            enabled = true,
+            telegramEnabled = false,
+            lineEnabled = true,
+            lineChannelAccessToken = "LINE_CHANNEL_ACCESS_TOKEN_1234567890",
+            lineTargetId = "U1234567890abcdef"
+        )
+        assertTrue(lineOnlyConfig.isLineConfigured)
+        assertTrue(ForwardRuleEngine.shouldForward(lineOnlyConfig, sms))
     }
 
     @Test
@@ -100,7 +150,6 @@ class ForwardRuleEngineTest {
 
         assertFalse(ForwardRuleEngine.isDuplicate(smsEvent, nowMs = 1000L))
         assertTrue(ForwardRuleEngine.isDuplicate(notifEvent, nowMs = 3000L))
-        // 超過 5 秒視窗後允許再次發送
         assertFalse(ForwardRuleEngine.isDuplicate(smsEvent, nowMs = 8000L))
     }
 
@@ -113,12 +162,16 @@ class ForwardRuleEngineTest {
 
     @Test
     fun partialLegacyConfigParsesSafelyWithDefaults() {
-        val parsed = SmsSensePrefs.parseConfigJson("""{"telegramChatId":"111222"}""")
+        val parsed = SmsSensePrefs.parseConfigJson("""{"telegramChatId":"111222","lowBatteryThreshold":25}""")
         assertTrue(parsed.enabled)
+        assertTrue(parsed.telegramEnabled)
+        assertTrue(parsed.offlineQueueEnabled)
+        assertFalse(parsed.lineEnabled)
+        assertFalse(parsed.webhookEnabled)
         assertTrue(parsed.smsForwardEnabled)
         assertTrue(parsed.callForwardEnabled)
         assertTrue(parsed.lowBatteryAlertEnabled)
-        assertEquals(20, parsed.lowBatteryThreshold)
+        assertEquals(listOf(25), parsed.lowBatteryThresholds)
         assertEquals("111222", parsed.telegramChatId)
         assertEquals(SmsSenseConfig.DEFAULT_PROMPT_PACKAGES, parsed.whitelistedPromptPackages)
     }
@@ -129,27 +182,44 @@ class ForwardRuleEngineTest {
         val callEvent = ForwardEvent(
             channel = SourceChannel.INCOMING_CALL,
             packageName = "telephony",
-            sourceTitle = "0988123456",
-            content = "備用機收到來電：0988123456"
+            sourceTitle = "0900123456",
+            receiverSimInfo = "SIM1",
+            content = "收到來電：0900123456"
         )
         assertTrue(ForwardRuleEngine.shouldForward(noAliasConfig, callEvent))
-        val html = ForwardRuleEngine.formatTelegramHtml(noAliasConfig, callEvent, deviceModel = "SM-N960F")
-        assertTrue(html.contains("[SM-N960F]"))
-        assertTrue(html.contains("0988123456"))
+        val html = ForwardRuleEngine.formatTelegramHtml(noAliasConfig, callEvent, deviceModel = "PhoneModel")
+        assertTrue(html.contains("[PhoneModel]"))
+        assertTrue(html.contains("來電號碼：<b>0900123456</b>"))
+        assertTrue(html.contains("收受：<b>SIM1</b>"))
         assertFalse(html.contains("🔑 驗證碼："))
     }
 
     @Test
-    fun lowBatteryHysteresisPreventsRepeatedSpam() {
-        // 掉到 20% 未充電 -> 觸發一次
-        assertEquals(true to true, ForwardRuleEngine.evaluateLowBatteryTrigger(20, false, 20, false))
-        // 掉到 19% 已發送過 -> 不重複發
-        assertEquals(false to true, ForwardRuleEngine.evaluateLowBatteryTrigger(19, false, 20, true))
-        // 充到 25% 未達門檻+10% 且未充電 -> 維持已發送狀態
-        assertEquals(false to true, ForwardRuleEngine.evaluateLowBatteryTrigger(25, false, 20, true))
-        // 插上充電中 -> 立刻重置旗標
-        assertEquals(false to false, ForwardRuleEngine.evaluateLowBatteryTrigger(22, true, 20, true))
-        // 充回 30% (門檻+10%) -> 重置旗標
-        assertEquals(false to false, ForwardRuleEngine.evaluateLowBatteryTrigger(30, false, 20, true))
+    fun multiBatteryThresholdsTriggerSequentiallyAndResetOnCharge() {
+        val thresholds = listOf(15, 20, 30)
+        // 跌到 29% -> 觸發 30% 門檻
+        val (trig1, sent1) = ForwardRuleEngine.evaluateMultiBatteryThresholds(29, false, thresholds, emptySet())
+        assertEquals(30, trig1)
+        assertEquals(setOf(30), sent1)
+
+        // 跌到 25% -> 30% 已觸發過、尚未達 20% -> 不重複觸發
+        val (trig2, sent2) = ForwardRuleEngine.evaluateMultiBatteryThresholds(25, false, thresholds, sent1)
+        assertNull(trig2)
+        assertEquals(setOf(30), sent2)
+
+        // 跌到 20% -> 觸發 20% 門檻
+        val (trig3, sent3) = ForwardRuleEngine.evaluateMultiBatteryThresholds(20, false, thresholds, sent2)
+        assertEquals(20, trig3)
+        assertEquals(setOf(30, 20), sent3)
+
+        // 跌到 15% -> 觸發 15% 門檻
+        val (trig4, sent4) = ForwardRuleEngine.evaluateMultiBatteryThresholds(15, false, thresholds, sent3)
+        assertEquals(15, trig4)
+        assertEquals(setOf(30, 20, 15), sent4)
+
+        // 插上充電 -> 全部重置
+        val (trig5, sent5) = ForwardRuleEngine.evaluateMultiBatteryThresholds(16, true, thresholds, sent4)
+        assertNull(trig5)
+        assertTrue(sent5.isEmpty())
     }
 }

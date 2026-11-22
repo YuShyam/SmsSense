@@ -12,7 +12,7 @@ import com.yushyam.smssense.engine.ForwardRuleEngine
 import com.yushyam.smssense.service.ForwardDispatcher
 
 /**
- * 軌道 5：系統低電量事件與開機排程恢復接收器 (Low Battery & Boot Receiver)
+ * 系統電量通知事件與開機排程恢復接收器 (Battery Notification & Boot Receiver)
  */
 class BatteryAlertReceiver : BroadcastReceiver() {
 
@@ -22,7 +22,7 @@ class BatteryAlertReceiver : BroadcastReceiver() {
                 ForwardDispatcher.syncBatteryMonitor(context)
             }
             Intent.ACTION_BATTERY_OKAY -> {
-                SmsSensePrefs(context).setLowBatteryAlertSent(false)
+                SmsSensePrefs(context).saveSentBatteryThresholds(emptySet())
             }
             Intent.ACTION_BATTERY_LOW -> {
                 checkAndAlertBattery(context)
@@ -52,26 +52,26 @@ class BatteryAlertReceiver : BroadcastReceiver() {
             if (!config.enabled || !config.lowBatteryAlertEnabled) return
 
             val (percent, isCharging) = readBatteryStatus(context)
-            val alreadySent = prefs.isLowBatteryAlertSent()
-            val (shouldAlert, nextSent) = ForwardRuleEngine.evaluateLowBatteryTrigger(
+            val alreadySent = prefs.loadSentBatteryThresholds()
+            val (triggeredThreshold, nextSent) = ForwardRuleEngine.evaluateMultiBatteryThresholds(
                 levelPercent = percent,
                 isCharging = isCharging,
-                thresholdPercent = config.lowBatteryThreshold,
-                alreadySent = alreadySent
+                configuredThresholds = config.lowBatteryThresholds,
+                alreadySentThresholds = alreadySent
             )
 
             if (nextSent != alreadySent) {
-                prefs.setLowBatteryAlertSent(nextSent)
+                prefs.saveSentBatteryThresholds(nextSent)
             }
 
-            if (shouldAlert) {
+            if (triggeredThreshold != null) {
                 ForwardDispatcher.dispatch(
                     context = context,
                     event = ForwardEvent(
                         channel = SourceChannel.LOW_BATTERY,
                         packageName = "battery",
-                        sourceTitle = "電池電量 $percent%",
-                        content = "目前剩餘電量 $percent%（低於設定門檻 ${config.lowBatteryThreshold}%），請儘速為備用機充電以免漏接驗證碼。",
+                        sourceTitle = "電量 $percent%",
+                        content = "目前電量剩餘 $percent%（已達通知門檻 $triggeredThreshold%），請記得充電。",
                         timestampMs = System.currentTimeMillis()
                     )
                 )

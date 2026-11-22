@@ -14,9 +14,13 @@ import androidx.work.WorkManager
 import com.yushyam.smssense.data.model.ForwardEvent
 import com.yushyam.smssense.data.model.ForwardLogItem
 import com.yushyam.smssense.data.model.PendingForwardItem
+import com.yushyam.smssense.data.model.SmsSenseConfig
+import com.yushyam.smssense.data.model.TargetDestination
 import com.yushyam.smssense.data.repo.SmsSensePrefs
 import com.yushyam.smssense.engine.ForwardRuleEngine
+import com.yushyam.smssense.engine.LineSender
 import com.yushyam.smssense.engine.TelegramSender
+import com.yushyam.smssense.engine.WebhookSender
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,13 +29,13 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
- * 統一事件轉發調度與離線補發管理器 (Unified Forward Dispatcher)
+ * 核心多通道轉發協調與離線佇列派發器 (Multi-Channel Forward Dispatcher & Offline Retry Coordinator)
  */
 object ForwardDispatcher {
 
     const val ACTION_LOGS_UPDATED = "com.yushyam.smssense.ACTION_LOGS_UPDATED"
-    private const val RETRY_WORK_NAME = "smssense_retry_queue"
-    private const val BATTERY_WORK_NAME = "smssense_battery_guard"
+    private const val RETRY_WORK_NAME = "smssense_offline_retry_work"
+    private const val BATTERY_WORK_NAME = "smssense_battery_monitor_work"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -41,7 +45,7 @@ object ForwardDispatcher {
         val config = prefs.loadConfig()
 
         if (!ForwardRuleEngine.shouldForward(config, event)) return
-        if (ForwardRuleEngine.isDuplicate(event)) return
+        if (ForwardRuleEngine.isDuplicate(event, event.timestampMs)) return
 
         val model = Build.MODEL.orEmpty()
         val html = ForwardRuleEngine.formatTelegramHtml(
@@ -50,78 +54,165 @@ object ForwardDispatcher {
             isDelayedRetry = false,
             deviceModel = model
         )
+        val plain = ForwardRuleEngine.formatPlainText(
+            config = config,
+            event = event,
+            isDelayedRetry = false,
+            deviceModel = model
+        )
 
         scope.launch {
-            val (ok, detail) = TelegramSender.sendHtmlMessage(
-                botToken = config.telegramBotToken,
-                chatId = config.telegramChatId,
-                htmlText = html
-            )
+            val activeTargets = mutableListOf<TargetDestination>()
+            if (config.isTelegramConfigured) activeTargets.add(TargetDestination.TELEGRAM)
+            if (config.isLineConfigured) activeTargets.add(TargetDestination.LINE)
+            if (config.isWebhookConfigured) activeTargets.add(TargetDestination.WEBHOOK)
 
-            if (ok) {
+            val results = sendToTargets(config, activeTargets, html, plain)
+            val failedTargets = results.filter { !it.second }.map { it.first.name }
+            val allSucceeded = failedTargets.isEmpty()
+            val summaryDetail = results.joinToString(" | ") { "${it.first.label}: ${it.third}" }
+
+            val logTitle = buildString {
+                append(event.sourceTitle.ifBlank { event.packageName })
+                if (event.receiverSimInfo.isNotBlank()) {
+                    append(" ➔ ").append(event.receiverSimInfo)
+                }
+            }
+
+            if (allSucceeded) {
                 prefs.appendLog(
                     ForwardLogItem(
                         timestampMs = event.timestampMs,
                         channelLabel = event.channel.labelZh,
-                        sourceTitle = event.sourceTitle.ifBlank { event.packageName },
+                        sourceTitle = logTitle,
                         preview = event.content.trim().take(120),
                         delivered = true,
-                        statusDetail = detail
+                        statusDetail = summaryDetail
                     )
                 )
-                // 寄送成功代表目前網路正常，順便消化離線佇列
                 flushPendingQueueBlocking(appContext)
             } else {
-                // 斷網或暫時失敗：加入離線重試佇列，並排程待網路恢復後自動補發
-                val delayedHtml = ForwardRuleEngine.formatTelegramHtml(
-                    config = config,
-                    event = event,
-                    isDelayedRetry = true,
-                    deviceModel = model
-                )
-                prefs.enqueuePending(
-                    PendingForwardItem(
-                        id = UUID.randomUUID().toString(),
-                        channelLabel = event.channel.labelZh,
-                        sourceTitle = event.sourceTitle.ifBlank { event.packageName },
-                        formattedHtml = delayedHtml,
-                        createdAtMs = event.timestampMs,
-                        attempts = 1
+                if (config.offlineQueueEnabled) {
+                    val delayedHtml = ForwardRuleEngine.formatTelegramHtml(
+                        config = config,
+                        event = event,
+                        isDelayedRetry = true,
+                        deviceModel = model
                     )
-                )
+                    val delayedPlain = ForwardRuleEngine.formatPlainText(
+                        config = config,
+                        event = event,
+                        isDelayedRetry = true,
+                        deviceModel = model
+                    )
+                    prefs.enqueuePending(
+                        PendingForwardItem(
+                            id = UUID.randomUUID().toString(),
+                            channelLabel = event.channel.labelZh,
+                            sourceTitle = logTitle,
+                            formattedHtml = delayedHtml,
+                            formattedPlainText = delayedPlain,
+                            targetDestinations = failedTargets,
+                            createdAtMs = event.timestampMs,
+                            attempts = 1
+                        )
+                    )
+                    scheduleRetryWorker(appContext)
+                }
+
+                val statusMsg = if (config.offlineQueueEnabled) {
+                    "已排入離線補發（$summaryDetail）"
+                } else {
+                    "發送失敗，離線佇列已關閉（$summaryDetail）"
+                }
+
                 prefs.appendLog(
                     ForwardLogItem(
                         timestampMs = event.timestampMs,
                         channelLabel = event.channel.labelZh,
-                        sourceTitle = event.sourceTitle.ifBlank { event.packageName },
+                        sourceTitle = logTitle,
                         preview = event.content.trim().take(120),
                         delivered = false,
-                        statusDetail = "已排入離線補發（$detail）"
+                        statusDetail = statusMsg
                     )
                 )
-                scheduleRetryWorker(appContext)
             }
             notifyUi(appContext)
         }
+    }
+
+    fun sendToTargets(
+        config: SmsSenseConfig,
+        targets: List<TargetDestination>,
+        htmlText: String,
+        plainText: String
+    ): List<Triple<TargetDestination, Boolean, String>> {
+        val results = mutableListOf<Triple<TargetDestination, Boolean, String>>()
+        for (target in targets) {
+            when (target) {
+                TargetDestination.TELEGRAM -> {
+                    if (config.isTelegramConfigured) {
+                        val (ok, msg) = TelegramSender.sendHtmlMessage(
+                            botToken = config.telegramBotToken,
+                            chatId = config.telegramChatId,
+                            htmlText = htmlText
+                        )
+                        results.add(Triple(TargetDestination.TELEGRAM, ok, msg))
+                    }
+                }
+                TargetDestination.LINE -> {
+                    if (config.isLineConfigured) {
+                        val (ok, msg) = LineSender.sendPushMessage(
+                            channelAccessToken = config.lineChannelAccessToken,
+                            targetId = config.lineTargetId,
+                            plainText = plainText
+                        )
+                        results.add(Triple(TargetDestination.LINE, ok, msg))
+                    }
+                }
+                TargetDestination.WEBHOOK -> {
+                    if (config.isWebhookConfigured) {
+                        val (ok, msg) = WebhookSender.sendWebhook(
+                            webhookUrl = config.webhookUrl,
+                            secretHeader = config.webhookSecretHeader,
+                            plainText = plainText,
+                            htmlText = htmlText
+                        )
+                        results.add(Triple(TargetDestination.WEBHOOK, ok, msg))
+                    }
+                }
+            }
+        }
+        return results
     }
 
     fun flushPendingQueueBlocking(context: Context): Pair<Int, Int> {
         val appContext = context.applicationContext
         val prefs = SmsSensePrefs(appContext)
         val config = prefs.loadConfig()
-        val queue = prefs.loadPendingQueue()
-        if (queue.isEmpty() || !config.isTelegramConfigured) return 0 to queue.size
+        if (!config.enabled || !config.isAnyDestinationConfigured) {
+            return 0 to prefs.loadPendingQueue().size
+        }
 
-        var sentCount = 0
+        val queue = prefs.loadPendingQueue()
+        if (queue.isEmpty()) return 0 to 0
+
         val remaining = mutableListOf<PendingForwardItem>()
+        var sentCount = 0
 
         for (item in queue) {
-            val (ok, detail) = TelegramSender.sendHtmlMessage(
-                botToken = config.telegramBotToken,
-                chatId = config.telegramChatId,
-                htmlText = item.formattedHtml
-            )
-            if (ok) {
+            val targets = item.targetDestinations.mapNotNull { name ->
+                TargetDestination.entries.find { it.name == name }
+            }.ifEmpty { listOf(TargetDestination.TELEGRAM) }
+
+            val plain = item.formattedPlainText.ifBlank {
+                item.formattedHtml.replace(Regex("<[^>]+>"), "")
+            }
+            val results = sendToTargets(config, targets, item.formattedHtml, plain)
+            val stillFailed = results.filter { !it.second }.map { it.first.name }
+            val detail = results.joinToString(" | ") { "${it.first.label}: ${it.third}" }
+
+            if (stillFailed.isEmpty()) {
                 sentCount++
                 prefs.appendLog(
                     ForwardLogItem(
@@ -133,8 +224,13 @@ object ForwardDispatcher {
                         statusDetail = detail
                     )
                 )
-            } else if (item.attempts < 5) {
-                remaining.add(item.copy(attempts = item.attempts + 1))
+            } else if (item.attempts < 8) {
+                remaining.add(
+                    item.copy(
+                        targetDestinations = stillFailed,
+                        attempts = item.attempts + 1
+                    )
+                )
             }
         }
 
