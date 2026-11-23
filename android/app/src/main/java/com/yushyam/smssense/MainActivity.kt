@@ -1,6 +1,7 @@
 package com.yushyam.smssense
 
 import android.Manifest
+import android.app.Activity
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -20,6 +21,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -36,8 +38,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -46,6 +50,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.yushyam.smssense.data.model.ForwardEvent
@@ -54,6 +59,7 @@ import com.yushyam.smssense.data.model.InstalledAppInfo
 import com.yushyam.smssense.data.model.SmsSenseConfig
 import com.yushyam.smssense.data.model.SourceChannel
 import com.yushyam.smssense.data.model.TargetDestination
+import com.yushyam.smssense.data.model.ThemeMode
 import com.yushyam.smssense.data.repo.SmsSensePrefs
 import com.yushyam.smssense.engine.ForwardRuleEngine
 import com.yushyam.smssense.engine.SimSlotResolver
@@ -68,27 +74,31 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-// Shadcn/UI Zinc 極簡中性色票
+// Shadcn/UI Zinc 動態深淺色票定義 (Dynamic Light & Dark Zinc Palette)
 private object SmsPalette {
-    val Bg = Color(0xFFFAFAFA)
-    val Surface = Color(0xFFFFFFFF)
-    val Subtle = Color(0xFFF4F4F5)
-    val Border = Color(0xFFE4E4E7)
-    val Ink = Color(0xFF09090B)
-    val InkPrimary = Color(0xFF18181B)
-    val InkMuted = Color(0xFF71717A)
-    val InkFaint = Color(0xFFA1A1AA)
+    var isDark by mutableStateOf(false)
 
-    val GreenBg = Color(0xFFECFDF5)
-    val GreenBorder = Color(0xFFA7F3D0)
-    val GreenFg = Color(0xFF047857)
+    val Bg: Color get() = if (isDark) Color(0xFF09090B) else Color(0xFFFAFAFA)
+    val Surface: Color get() = if (isDark) Color(0xFF18181B) else Color(0xFFFFFFFF)
+    val Subtle: Color get() = if (isDark) Color(0xFF27272A) else Color(0xFFF4F4F5)
+    val Border: Color get() = if (isDark) Color(0xFF27272A) else Color(0xFFE4E4E7)
+    val Ink: Color get() = if (isDark) Color(0xFFFAFAFA) else Color(0xFF09090B)
+    val InkPrimary: Color get() = if (isDark) Color(0xFFFAFAFA) else Color(0xFF18181B)
+    val OnPrimary: Color get() = if (isDark) Color(0xFF18181B) else Color(0xFFFFFFFF)
+    val InkMuted: Color get() = if (isDark) Color(0xFFA1A1AA) else Color(0xFF71717A)
+    val InkFaint: Color get() = if (isDark) Color(0xFF71717A) else Color(0xFFA1A1AA)
 
-    val AmberBg = Color(0xFFFFFBEB)
-    val AmberBorder = Color(0xFFFDE68A)
-    val AmberFg = Color(0xFFB45309)
+    val GreenBg: Color get() = if (isDark) Color(0xFF052E16) else Color(0xFFECFDF5)
+    val GreenBorder: Color get() = if (isDark) Color(0xFF14532D) else Color(0xFFA7F3D0)
+    val GreenFg: Color get() = if (isDark) Color(0xFF34D399) else Color(0xFF047857)
 
-    val RedBg = Color(0xFFFEF2F2)
-    val RedFg = Color(0xFFBE123C)
+    val AmberBg: Color get() = if (isDark) Color(0xFF271705) else Color(0xFFFFFBEB)
+    val AmberBorder: Color get() = if (isDark) Color(0xFF78350F) else Color(0xFFFDE68A)
+    val AmberFg: Color get() = if (isDark) Color(0xFFFBBF24) else Color(0xFFB45309)
+    val AmberSubText: Color get() = if (isDark) Color(0xFFFDE68A) else Color(0xFF92400E)
+
+    val RedBg: Color get() = if (isDark) Color(0xFF2A0A12) else Color(0xFFFEF2F2)
+    val RedFg: Color get() = if (isDark) Color(0xFFFB7185) else Color(0xFFBE123C)
 }
 
 private enum class SmsTab(val title: String, val icon: ImageVector) {
@@ -113,28 +123,11 @@ class MainActivity : ComponentActivity() {
         ForwardDispatcher.syncBatteryMonitor(this)
 
         setContent {
-            MaterialTheme(
-                colorScheme = lightColorScheme(
-                    primary = SmsPalette.InkPrimary,
-                    onPrimary = Color.White,
-                    secondary = Color(0xFF3F3F46),
-                    background = SmsPalette.Bg,
-                    surface = SmsPalette.Surface,
-                    surfaceVariant = SmsPalette.Subtle,
-                    outline = SmsPalette.Border
-                )
-            ) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = SmsPalette.Bg
-                ) {
-                    SmsSenseApp(
-                        context = this,
-                        onRequestSmsPermission = { requestSmsPermissions() },
-                        onShowToast = { msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
-                    )
-                }
-            }
+            SmsSenseApp(
+                context = this,
+                onRequestSmsPermission = { requestSmsPermissions() },
+                onShowToast = { msg -> Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+            )
         }
     }
 
@@ -185,6 +178,55 @@ fun SmsSenseApp(
     var installedApps by remember { mutableStateOf<List<InstalledAppInfo>>(emptyList()) }
     var pickerTarget by remember { mutableStateOf<WhitelistTarget?>(null) }
 
+    val systemDark = isSystemInDarkTheme()
+    val currentThemeMode = ThemeMode.fromSetting(config.themeMode)
+    val useDark = when (currentThemeMode) {
+        ThemeMode.SYSTEM -> systemDark
+        ThemeMode.LIGHT -> false
+        ThemeMode.DARK -> true
+    }
+    SmsPalette.isDark = useDark
+
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (context as? Activity)?.window ?: return@SideEffect
+            @Suppress("DEPRECATION")
+            window.statusBarColor = SmsPalette.Surface.toArgb()
+            @Suppress("DEPRECATION")
+            window.navigationBarColor = SmsPalette.Surface.toArgb()
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.isAppearanceLightStatusBars = !useDark
+            controller.isAppearanceLightNavigationBars = !useDark
+        }
+    }
+
+    val colorScheme = if (useDark) {
+        darkColorScheme(
+            primary = SmsPalette.InkPrimary,
+            onPrimary = SmsPalette.OnPrimary,
+            secondary = Color(0xFFD4D4D8),
+            background = SmsPalette.Bg,
+            surface = SmsPalette.Surface,
+            onSurface = SmsPalette.Ink,
+            surfaceVariant = SmsPalette.Subtle,
+            onSurfaceVariant = SmsPalette.InkMuted,
+            outline = SmsPalette.Border
+        )
+    } else {
+        lightColorScheme(
+            primary = SmsPalette.InkPrimary,
+            onPrimary = SmsPalette.OnPrimary,
+            secondary = Color(0xFF3F3F46),
+            background = SmsPalette.Bg,
+            surface = SmsPalette.Surface,
+            onSurface = SmsPalette.Ink,
+            surfaceVariant = SmsPalette.Subtle,
+            onSurfaceVariant = SmsPalette.InkMuted,
+            outline = SmsPalette.Border
+        )
+    }
+
     fun refreshState() {
         config = prefs.loadConfig()
         logs = prefs.loadLogs()
@@ -196,6 +238,12 @@ fun SmsSenseApp(
         batteryPercent = BatteryAlertReceiver.readBatteryStatus(context).first
     }
 
+    fun setThemeMode(mode: ThemeMode) {
+        val next = config.copy(themeMode = mode.settingValue)
+        prefs.saveConfig(next)
+        config = next
+    }
+
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             val loaded = loadInstalledApps(context)
@@ -203,7 +251,6 @@ fun SmsSenseApp(
         }
     }
 
-    // 監聽 Activity ON_RESUME：從系統權限設定頁返回時自動重刷狀態
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -242,310 +289,334 @@ fun SmsSenseApp(
         installedApps.associate { it.packageName to it.label }
     }
 
-    Scaffold(
-        containerColor = SmsPalette.Bg,
-        topBar = {
-            Column {
-                TopAppBar(
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = SmsPalette.Surface),
-                    title = {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Text("SmsSense", fontWeight = FontWeight.Bold, fontSize = 19.sp, color = SmsPalette.Ink)
-                            val ready = config.enabled && config.isAnyDestinationConfigured
-                            StatusPill(
-                                label = if (ready) "轉發中" else "待設定",
-                                bg = if (ready) SmsPalette.GreenBg else SmsPalette.AmberBg,
-                                border = if (ready) SmsPalette.GreenBorder else SmsPalette.AmberBorder,
-                                fg = if (ready) SmsPalette.GreenFg else SmsPalette.AmberFg
-                            )
-                        }
-                    },
-                    actions = {
-                        IconButton(onClick = {
-                            refreshState()
-                            onShowToast("狀態已更新")
-                        }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "重新整理", tint = SmsPalette.InkPrimary)
+    MaterialTheme(colorScheme = colorScheme) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = SmsPalette.Bg
+        ) {
+            Scaffold(
+                containerColor = SmsPalette.Bg,
+                topBar = {
+                    Column {
+                        TopAppBar(
+                            colors = TopAppBarDefaults.topAppBarColors(containerColor = SmsPalette.Surface),
+                            title = {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Text("SmsSense", fontWeight = FontWeight.Bold, fontSize = 19.sp, color = SmsPalette.Ink)
+                                    val ready = config.enabled && config.isAnyDestinationConfigured
+                                    StatusPill(
+                                        label = if (ready) "轉發中" else "待設定",
+                                        bg = if (ready) SmsPalette.GreenBg else SmsPalette.AmberBg,
+                                        border = if (ready) SmsPalette.GreenBorder else SmsPalette.AmberBorder,
+                                        fg = if (ready) SmsPalette.GreenFg else SmsPalette.AmberFg
+                                    )
+                                }
+                            },
+                            actions = {
+                                IconButton(onClick = {
+                                    val nextMode = currentThemeMode.next()
+                                    setThemeMode(nextMode)
+                                    onShowToast("外觀：${nextMode.labelZh}")
+                                }) {
+                                    Icon(
+                                        when (currentThemeMode) {
+                                            ThemeMode.SYSTEM -> Icons.Default.BrightnessAuto
+                                            ThemeMode.LIGHT -> Icons.Default.LightMode
+                                            ThemeMode.DARK -> Icons.Default.DarkMode
+                                        },
+                                        contentDescription = "切換深淺色",
+                                        tint = SmsPalette.InkPrimary
+                                    )
+                                }
+                                IconButton(onClick = {
+                                    refreshState()
+                                    onShowToast("狀態已更新")
+                                }) {
+                                    Icon(Icons.Default.Refresh, contentDescription = "重新整理", tint = SmsPalette.InkPrimary)
+                                }
+                            }
+                        )
+                        HorizontalDivider(color = SmsPalette.Border, thickness = 1.dp)
+                    }
+                },
+                bottomBar = {
+                    Column {
+                        HorizontalDivider(color = SmsPalette.Border, thickness = 1.dp)
+                        NavigationBar(containerColor = SmsPalette.Surface, tonalElevation = 0.dp) {
+                            SmsTab.entries.forEach { tab ->
+                                val selected = selectedTab == tab
+                                NavigationBarItem(
+                                    selected = selected,
+                                    onClick = {
+                                        selectedTab = tab
+                                        refreshState()
+                                    },
+                                    icon = { Icon(tab.icon, contentDescription = tab.title, modifier = Modifier.size(22.dp)) },
+                                    label = {
+                                        Text(
+                                            tab.title,
+                                            fontSize = 12.sp,
+                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                                        )
+                                    },
+                                    colors = NavigationBarItemDefaults.colors(
+                                        selectedIconColor = SmsPalette.Ink,
+                                        selectedTextColor = SmsPalette.Ink,
+                                        unselectedIconColor = SmsPalette.InkMuted,
+                                        unselectedTextColor = SmsPalette.InkMuted,
+                                        indicatorColor = SmsPalette.Subtle
+                                    )
+                                )
+                            }
                         }
                     }
-                )
-                HorizontalDivider(color = SmsPalette.Border, thickness = 1.dp)
-            }
-        },
-        bottomBar = {
-            Column {
-                HorizontalDivider(color = SmsPalette.Border, thickness = 1.dp)
-                NavigationBar(containerColor = SmsPalette.Surface, tonalElevation = 0.dp) {
-                    SmsTab.entries.forEach { tab ->
-                        val selected = selectedTab == tab
-                        NavigationBarItem(
-                            selected = selected,
-                            onClick = {
-                                selectedTab = tab
+                }
+            ) { padding ->
+                Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+                    when (selectedTab) {
+                        SmsTab.OVERVIEW -> OverviewTab(
+                            config = config,
+                            hasSmsPerm = hasSmsPerm,
+                            hasCallPerm = hasCallPerm,
+                            hasNotifPerm = hasNotifPerm,
+                            hasPromptPerm = hasPromptPerm,
+                            batteryPercent = batteryPercent,
+                            pendingCount = pendingCount,
+                            isSendingTest = isSendingTest,
+                            onToggleEnabled = { checked ->
+                                val next = config.copy(enabled = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                                ForwardDispatcher.syncBatteryMonitor(context)
+                            },
+                            onSendTest = {
+                                if (!config.isAnyDestinationConfigured) {
+                                    onShowToast("請先到「設定」填寫推播通道資訊")
+                                    selectedTab = SmsTab.SETTINGS
+                                    return@OverviewTab
+                                }
+                                isSendingTest = true
+                                scope.launch(Dispatchers.IO) {
+                                    val detectedSim = SimSlotResolver.resolveSimDescription(context, Intent())
+                                    val testEvent = ForwardEvent(
+                                        channel = SourceChannel.SMS,
+                                        packageName = "sms",
+                                        sourceTitle = "系統測試",
+                                        receiverSimInfo = detectedSim,
+                                        content = "【SmsSense】您的驗證碼是 829401，請於 5 分鐘內完成驗證。轉發通道連線正常。"
+                                    )
+                                    val model = Build.MODEL.orEmpty()
+                                    val html = ForwardRuleEngine.formatTelegramHtml(
+                                        config = config,
+                                        event = testEvent,
+                                        deviceModel = model
+                                    )
+                                    val plain = ForwardRuleEngine.formatPlainText(
+                                        config = config,
+                                        event = testEvent,
+                                        deviceModel = model
+                                    )
+                                    val activeTargets = mutableListOf<TargetDestination>()
+                                    if (config.isTelegramConfigured) activeTargets.add(TargetDestination.TELEGRAM)
+                                    if (config.isLineConfigured) activeTargets.add(TargetDestination.LINE)
+                                    if (config.isWebhookConfigured) activeTargets.add(TargetDestination.WEBHOOK)
+
+                                    val results = ForwardDispatcher.sendToTargets(config, activeTargets, html, plain)
+                                    val allOk = results.isNotEmpty() && results.all { it.second }
+                                    val detail = results.joinToString(" | ") { "${it.first.label}: ${it.third}" }
+
+                                    prefs.appendLog(
+                                        ForwardLogItem(
+                                            timestampMs = System.currentTimeMillis(),
+                                            channelLabel = "測試訊息",
+                                            sourceTitle = activeTargets.joinToString("+") { it.label },
+                                            preview = "測試連線推播",
+                                            delivered = allOk,
+                                            statusDetail = detail
+                                        )
+                                    )
+                                    withContext(Dispatchers.Main) {
+                                        isSendingTest = false
+                                        refreshState()
+                                        onShowToast(if (allOk) "測試訊息已送達（${activeTargets.joinToString { it.label }}）！" else detail)
+                                    }
+                                }
+                            },
+                            onFlushPending = {
+                                scope.launch(Dispatchers.IO) {
+                                    val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
+                                    withContext(Dispatchers.Main) {
+                                        refreshState()
+                                        onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
+                                    }
+                                }
+                            },
+                            onGoSettings = { selectedTab = SmsTab.SETTINGS },
+                            onGoWhitelist = { selectedTab = SmsTab.WHITELIST }
+                        )
+
+                        SmsTab.WHITELIST -> WhitelistTab(
+                            config = config,
+                            appLabelMap = appLabelMap,
+                            onToggleSms = { checked ->
+                                val next = config.copy(smsForwardEnabled = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                            },
+                            onToggleOtpHint = { checked ->
+                                val next = config.copy(appendOtpHint = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                            },
+                            onToggleNotif = { checked ->
+                                val next = config.copy(notificationForwardEnabled = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                            },
+                            onTogglePrompt = { checked ->
+                                val next = config.copy(promptForwardEnabled = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                            },
+                            onToggleCall = { checked ->
+                                val next = config.copy(callForwardEnabled = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                            },
+                            onToggleLowBattery = { checked ->
+                                val next = config.copy(lowBatteryAlertEnabled = checked)
+                                prefs.saveConfig(next)
+                                config = next
+                                ForwardDispatcher.syncBatteryMonitor(context)
+                            },
+                            onToggleBatteryThreshold = { pct ->
+                                val current = config.lowBatteryThresholds.toMutableSet()
+                                if (pct in current) {
+                                    if (current.size > 1) {
+                                        current.remove(pct)
+                                    } else {
+                                        onShowToast("請至少保留一項電量通知門檻")
+                                        return@WhitelistTab
+                                    }
+                                } else {
+                                    current.add(pct)
+                                }
+                                val next = config.copy(lowBatteryThresholds = current.sorted())
+                                prefs.saveConfig(next)
+                                config = prefs.loadConfig()
+                                prefs.saveSentBatteryThresholds(emptySet())
+                                ForwardDispatcher.syncBatteryMonitor(context)
+                            },
+                            onAddNotifApp = { pickerTarget = WhitelistTarget.NOTIF },
+                            onRemoveNotifApp = { pkg ->
+                                val next = config.copy(whitelistedNotifPackages = config.whitelistedNotifPackages.filterNot { it == pkg })
+                                prefs.saveConfig(next)
+                                config = next
+                            },
+                            onAddPromptApp = { pickerTarget = WhitelistTarget.PROMPT },
+                            onRemovePromptApp = { pkg ->
+                                val next = config.copy(whitelistedPromptPackages = config.whitelistedPromptPackages.filterNot { it == pkg })
+                                prefs.saveConfig(next)
+                                config = next
+                            }
+                        )
+
+                        SmsTab.SETTINGS -> SettingsTab(
+                            config = config,
+                            currentThemeMode = currentThemeMode,
+                            hasSmsPerm = hasSmsPerm,
+                            hasCallPerm = hasCallPerm,
+                            hasNotifPerm = hasNotifPerm,
+                            hasPromptPerm = hasPromptPerm,
+                            pendingCount = pendingCount,
+                            onSelectThemeMode = { mode -> setThemeMode(mode) },
+                            onSaveConfig = { updated ->
+                                prefs.saveConfig(updated)
+                                config = prefs.loadConfig()
+                                onShowToast("設定已儲存")
+                            },
+                            onFlushPending = {
+                                scope.launch(Dispatchers.IO) {
+                                    val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
+                                    withContext(Dispatchers.Main) {
+                                        refreshState()
+                                        onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
+                                    }
+                                }
+                            },
+                            onClearPending = {
+                                prefs.clearPendingQueue()
                                 refreshState()
+                                onShowToast("已清空待補發佇列")
                             },
-                            icon = { Icon(tab.icon, contentDescription = tab.title, modifier = Modifier.size(22.dp)) },
-                            label = {
-                                Text(
-                                    tab.title,
-                                    fontSize = 12.sp,
-                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
+                            onRequestSmsPerm = onRequestSmsPermission,
+                            onOpenAppDetails = {
+                                val intent = Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.fromParts("package", context.packageName, null)
                                 )
+                                context.startActivity(intent)
                             },
-                            colors = NavigationBarItemDefaults.colors(
-                                selectedIconColor = SmsPalette.Ink,
-                                selectedTextColor = SmsPalette.Ink,
-                                unselectedIconColor = SmsPalette.InkMuted,
-                                unselectedTextColor = SmsPalette.InkMuted,
-                                indicatorColor = SmsPalette.Subtle
-                            )
+                            onOpenNotifSettings = {
+                                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                            },
+                            onOpenAccessibilitySettings = {
+                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            }
+                        )
+
+                        SmsTab.LOGS -> LogsTab(
+                            logs = logs,
+                            pendingCount = pendingCount,
+                            onFlushPending = {
+                                scope.launch(Dispatchers.IO) {
+                                    val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
+                                    withContext(Dispatchers.Main) {
+                                        refreshState()
+                                        onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
+                                    }
+                                }
+                            },
+                            onClearLogs = {
+                                prefs.clearLogs()
+                                refreshState()
+                                onShowToast("已清除紀錄")
+                            }
                         )
                     }
                 }
             }
-        }
-    ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
-            when (selectedTab) {
-                SmsTab.OVERVIEW -> OverviewTab(
-                    config = config,
-                    hasSmsPerm = hasSmsPerm,
-                    hasCallPerm = hasCallPerm,
-                    hasNotifPerm = hasNotifPerm,
-                    hasPromptPerm = hasPromptPerm,
-                    batteryPercent = batteryPercent,
-                    pendingCount = pendingCount,
-                    isSendingTest = isSendingTest,
-                    onToggleEnabled = { checked ->
-                        val next = config.copy(enabled = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                        ForwardDispatcher.syncBatteryMonitor(context)
-                    },
-                    onSendTest = {
-                        if (!config.isAnyDestinationConfigured) {
-                            onShowToast("請先到「設定」填寫推播通道資訊")
-                            selectedTab = SmsTab.SETTINGS
-                            return@OverviewTab
-                        }
-                        isSendingTest = true
-                        scope.launch(Dispatchers.IO) {
-                            val detectedSim = SimSlotResolver.resolveSimDescription(context, Intent())
-                            val testEvent = ForwardEvent(
-                                channel = SourceChannel.SMS,
-                                packageName = "sms",
-                                sourceTitle = "系統測試",
-                                receiverSimInfo = detectedSim,
-                                content = "【SmsSense】您的驗證碼是 829401，請於 5 分鐘內完成驗證。轉發通道連線正常。"
-                            )
-                            val model = Build.MODEL.orEmpty()
-                            val html = ForwardRuleEngine.formatTelegramHtml(
-                                config = config,
-                                event = testEvent,
-                                deviceModel = model
-                            )
-                            val plain = ForwardRuleEngine.formatPlainText(
-                                config = config,
-                                event = testEvent,
-                                deviceModel = model
-                            )
-                            val activeTargets = mutableListOf<TargetDestination>()
-                            if (config.isTelegramConfigured) activeTargets.add(TargetDestination.TELEGRAM)
-                            if (config.isLineConfigured) activeTargets.add(TargetDestination.LINE)
-                            if (config.isWebhookConfigured) activeTargets.add(TargetDestination.WEBHOOK)
 
-                            val results = ForwardDispatcher.sendToTargets(config, activeTargets, html, plain)
-                            val allOk = results.isNotEmpty() && results.all { it.second }
-                            val detail = results.joinToString(" | ") { "${it.first.label}: ${it.third}" }
+            pickerTarget?.let { target ->
+                val existing = if (target == WhitelistTarget.NOTIF) config.whitelistedNotifPackages
+                else config.whitelistedPromptPackages
 
-                            prefs.appendLog(
-                                ForwardLogItem(
-                                    timestampMs = System.currentTimeMillis(),
-                                    channelLabel = "測試訊息",
-                                    sourceTitle = activeTargets.joinToString("+") { it.label },
-                                    preview = "測試連線推播",
-                                    delivered = allOk,
-                                    statusDetail = detail
-                                )
-                            )
-                            withContext(Dispatchers.Main) {
-                                isSendingTest = false
-                                refreshState()
-                                onShowToast(if (allOk) "測試訊息已送達（${activeTargets.joinToString { it.label }}）！" else detail)
-                            }
-                        }
-                    },
-                    onFlushPending = {
-                        scope.launch(Dispatchers.IO) {
-                            val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
-                            withContext(Dispatchers.Main) {
-                                refreshState()
-                                onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
-                            }
-                        }
-                    },
-                    onGoSettings = { selectedTab = SmsTab.SETTINGS },
-                    onGoWhitelist = { selectedTab = SmsTab.WHITELIST }
-                )
-
-                SmsTab.WHITELIST -> WhitelistTab(
-                    config = config,
-                    appLabelMap = appLabelMap,
-                    onToggleSms = { checked ->
-                        val next = config.copy(smsForwardEnabled = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                    },
-                    onToggleOtpHint = { checked ->
-                        val next = config.copy(appendOtpHint = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                    },
-                    onToggleNotif = { checked ->
-                        val next = config.copy(notificationForwardEnabled = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                    },
-                    onTogglePrompt = { checked ->
-                        val next = config.copy(promptForwardEnabled = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                    },
-                    onToggleCall = { checked ->
-                        val next = config.copy(callForwardEnabled = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                    },
-                    onToggleLowBattery = { checked ->
-                        val next = config.copy(lowBatteryAlertEnabled = checked)
-                        prefs.saveConfig(next)
-                        config = next
-                        ForwardDispatcher.syncBatteryMonitor(context)
-                    },
-                    onToggleBatteryThreshold = { pct ->
-                        val current = config.lowBatteryThresholds.toMutableSet()
-                        if (pct in current) {
-                            if (current.size > 1) {
-                                current.remove(pct)
-                            } else {
-                                onShowToast("請至少保留一項電量通知門檻")
-                                return@WhitelistTab
-                            }
+                AppPickerDialog(
+                    title = if (target == WhitelistTarget.NOTIF) "選擇應用通知白名單" else "選擇登入彈窗白名單",
+                    installedApps = installedApps,
+                    selectedPackages = existing.toSet(),
+                    onDismiss = { pickerTarget = null },
+                    onTogglePackage = { pkg ->
+                        val updated = if (pkg in existing) existing.filterNot { it == pkg } else existing + pkg
+                        val next = if (target == WhitelistTarget.NOTIF) {
+                            config.copy(whitelistedNotifPackages = updated)
                         } else {
-                            current.add(pct)
+                            config.copy(whitelistedPromptPackages = updated)
                         }
-                        val next = config.copy(lowBatteryThresholds = current.sorted())
-                        prefs.saveConfig(next)
-                        config = prefs.loadConfig()
-                        prefs.saveSentBatteryThresholds(emptySet())
-                        ForwardDispatcher.syncBatteryMonitor(context)
-                    },
-                    onAddNotifApp = { pickerTarget = WhitelistTarget.NOTIF },
-                    onRemoveNotifApp = { pkg ->
-                        val next = config.copy(whitelistedNotifPackages = config.whitelistedNotifPackages.filterNot { it == pkg })
                         prefs.saveConfig(next)
                         config = next
-                    },
-                    onAddPromptApp = { pickerTarget = WhitelistTarget.PROMPT },
-                    onRemovePromptApp = { pkg ->
-                        val next = config.copy(whitelistedPromptPackages = config.whitelistedPromptPackages.filterNot { it == pkg })
-                        prefs.saveConfig(next)
-                        config = next
-                    }
-                )
-
-                SmsTab.SETTINGS -> SettingsTab(
-                    config = config,
-                    hasSmsPerm = hasSmsPerm,
-                    hasCallPerm = hasCallPerm,
-                    hasNotifPerm = hasNotifPerm,
-                    hasPromptPerm = hasPromptPerm,
-                    pendingCount = pendingCount,
-                    onSaveConfig = { updated ->
-                        prefs.saveConfig(updated)
-                        config = prefs.loadConfig()
-                        onShowToast("設定已儲存")
-                    },
-                    onFlushPending = {
-                        scope.launch(Dispatchers.IO) {
-                            val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
-                            withContext(Dispatchers.Main) {
-                                refreshState()
-                                onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
-                            }
-                        }
-                    },
-                    onClearPending = {
-                        prefs.clearPendingQueue()
-                        refreshState()
-                        onShowToast("已清空待補發佇列")
-                    },
-                    onRequestSmsPerm = onRequestSmsPermission,
-                    onOpenAppDetails = {
-                        val intent = Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", context.packageName, null)
-                        )
-                        context.startActivity(intent)
-                    },
-                    onOpenNotifSettings = {
-                        context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                    },
-                    onOpenAccessibilitySettings = {
-                        context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                    }
-                )
-
-                SmsTab.LOGS -> LogsTab(
-                    logs = logs,
-                    pendingCount = pendingCount,
-                    onFlushPending = {
-                        scope.launch(Dispatchers.IO) {
-                            val (sent, remain) = ForwardDispatcher.flushPendingQueueBlocking(context)
-                            withContext(Dispatchers.Main) {
-                                refreshState()
-                                onShowToast("已補發 $sent 筆，剩餘 $remain 筆待送")
-                            }
-                        }
-                    },
-                    onClearLogs = {
-                        prefs.clearLogs()
-                        refreshState()
-                        onShowToast("已清除紀錄")
                     }
                 )
             }
         }
-    }
-
-    pickerTarget?.let { target ->
-        val existing = if (target == WhitelistTarget.NOTIF) config.whitelistedNotifPackages
-        else config.whitelistedPromptPackages
-
-        AppPickerDialog(
-            title = if (target == WhitelistTarget.NOTIF) "選擇應用通知白名單" else "選擇登入彈窗白名單",
-            installedApps = installedApps,
-            selectedPackages = existing.toSet(),
-            onDismiss = { pickerTarget = null },
-            onTogglePackage = { pkg ->
-                val updated = if (pkg in existing) existing.filterNot { it == pkg } else existing + pkg
-                val next = if (target == WhitelistTarget.NOTIF) {
-                    config.copy(whitelistedNotifPackages = updated)
-                } else {
-                    config.copy(whitelistedPromptPackages = updated)
-                }
-                prefs.saveConfig(next)
-                config = next
-            }
-        )
     }
 }
 
 // =====================================================================
-// Tab 1: 總覽（統一 4 字標籤、無括號冗言）
+// Tab 1: 總覽
 // =====================================================================
 @Composable
 private fun OverviewTab(
@@ -571,7 +642,6 @@ private fun OverviewTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 14.dp)
     ) {
-        // Hero 狀態卡
         item {
             CraftCard {
                 Row(
@@ -608,7 +678,6 @@ private fun OverviewTab(
             }
         }
 
-        // 監控狀態卡（全部嚴格 4 字對齊）
         item {
             CraftCard {
                 Text("監控狀態", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = SmsPalette.Ink)
@@ -681,7 +750,6 @@ private fun OverviewTab(
             }
         }
 
-        // 快捷動作
         item {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(
@@ -689,7 +757,10 @@ private fun OverviewTab(
                     enabled = !isSendingTest,
                     modifier = Modifier.weight(1f).height(46.dp),
                     shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = SmsPalette.InkPrimary)
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SmsPalette.InkPrimary,
+                        contentColor = SmsPalette.OnPrimary
+                    )
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
@@ -699,7 +770,11 @@ private fun OverviewTab(
                     onClick = onGoWhitelist,
                     modifier = Modifier.weight(1f).height(46.dp),
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, SmsPalette.Border)
+                    border = BorderStroke(1.dp, SmsPalette.Border),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = SmsPalette.Surface,
+                        contentColor = SmsPalette.InkPrimary
+                    )
                 ) {
                     Text("管理白名單", color = SmsPalette.InkPrimary, fontWeight = FontWeight.Medium)
                 }
@@ -751,7 +826,7 @@ private fun OverviewTab(
                     ) {
                         Column(Modifier.weight(1f)) {
                             Text("尚有設定或權限未完成", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = SmsPalette.AmberFg)
-                            Text("點擊前往「設定」配置通道或開啟權限。", fontSize = 12.sp, color = Color(0xFF92400E))
+                            Text("點擊前往「設定」配置通道或開啟權限。", fontSize = 12.sp, color = SmsPalette.AmberSubText)
                         }
                         Icon(Icons.Default.ChevronRight, contentDescription = null, tint = SmsPalette.AmberFg)
                     }
@@ -779,7 +854,7 @@ private fun ChannelStatusRow(title: String, active: Boolean, badgeText: String) 
 }
 
 // =====================================================================
-// Tab 2: 白名單（簡訊、來電、電量通知複選、應用與彈窗白名單）
+// Tab 2: 白名單
 // =====================================================================
 @Composable
 private fun WhitelistTab(
@@ -802,7 +877,6 @@ private fun WhitelistTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 14.dp)
     ) {
-        // 簡訊與來電設定
         item {
             CraftCard {
                 Text("簡訊與來電", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
@@ -813,7 +887,7 @@ private fun WhitelistTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("簡訊轉發", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text("簡訊轉發", fontWeight = FontWeight.Medium, fontSize = 14.sp, color = SmsPalette.Ink)
                         Text("保留完整原文，並標註系統 SIM 卡槽與發生時間", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                     Switch(checked = config.smsForwardEnabled, onCheckedChange = onToggleSms)
@@ -825,7 +899,7 @@ private fun WhitelistTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("置頂顯示驗證碼", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text("置頂顯示驗證碼", fontWeight = FontWeight.Medium, fontSize = 14.sp, color = SmsPalette.Ink)
                         Text("偵測到驗證碼時於頂部附一行單擊複製", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                     Switch(checked = config.appendOtpHint, onCheckedChange = onToggleOtpHint)
@@ -837,7 +911,7 @@ private fun WhitelistTab(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text("來電通知", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text("來電通知", fontWeight = FontWeight.Medium, fontSize = 14.sp, color = SmsPalette.Ink)
                         Text("響鈴時推播來電號碼與收受 SIM 卡槽", fontSize = 12.sp, color = SmsPalette.InkMuted)
                     }
                     Switch(checked = config.callForwardEnabled, onCheckedChange = onToggleCall)
@@ -845,7 +919,6 @@ private fun WhitelistTab(
             }
         }
 
-        // 電量通知（支援複選多個百分比門檻）
         item {
             CraftCard {
                 Row(
@@ -881,7 +954,7 @@ private fun WhitelistTab(
                                         "$pct%",
                                         fontSize = 13.sp,
                                         fontWeight = FontWeight.SemiBold,
-                                        color = if (selected) Color.White else SmsPalette.Ink
+                                        color = if (selected) SmsPalette.OnPrimary else SmsPalette.Ink
                                     )
                                 }
                             }
@@ -891,7 +964,6 @@ private fun WhitelistTab(
             }
         }
 
-        // 應用通知白名單
         item {
             CraftCard {
                 Row(
@@ -910,7 +982,10 @@ private fun WhitelistTab(
                     onClick = onAddNotifApp,
                     modifier = Modifier.fillMaxWidth().height(42.dp),
                     shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = SmsPalette.InkPrimary)
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SmsPalette.InkPrimary,
+                        contentColor = SmsPalette.OnPrimary
+                    )
                 ) {
                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
@@ -933,7 +1008,6 @@ private fun WhitelistTab(
             }
         }
 
-        // 登入彈窗白名單
         item {
             CraftCard {
                 Row(
@@ -998,16 +1072,18 @@ private fun PackageRow(label: String, packageName: String, onRemove: () -> Unit)
 }
 
 // =====================================================================
-// Tab 3: 設定（Shadcn Segmented Tabs 推播通道切換 + 系統權限與斷網設定）
+// Tab 3: 設定
 // =====================================================================
 @Composable
 private fun SettingsTab(
     config: SmsSenseConfig,
+    currentThemeMode: ThemeMode,
     hasSmsPerm: Boolean,
     hasCallPerm: Boolean,
     hasNotifPerm: Boolean,
     hasPromptPerm: Boolean,
     pendingCount: Int,
+    onSelectThemeMode: (ThemeMode) -> Unit,
     onSaveConfig: (SmsSenseConfig) -> Unit,
     onFlushPending: () -> Unit,
     onClearPending: () -> Unit,
@@ -1059,6 +1135,53 @@ private fun SettingsTab(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         contentPadding = PaddingValues(vertical = 14.dp)
     ) {
+        // 0. 外觀主題切換卡 (跟隨系統 / 淺色 / 深色)
+        item {
+            CraftCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("外觀主題", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                    Text("支援自動跟隨系統或手動切換", fontSize = 12.sp, color = SmsPalette.InkMuted)
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SmsPalette.Subtle, RoundedCornerShape(10.dp))
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    ThemeMode.entries.forEach { mode ->
+                        val selected = currentThemeMode == mode
+                        Surface(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(7.dp))
+                                .clickable { onSelectThemeMode(mode) },
+                            color = if (selected) SmsPalette.Surface else Color.Transparent,
+                            border = if (selected) BorderStroke(1.dp, SmsPalette.Border) else null,
+                            shape = RoundedCornerShape(7.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier.padding(vertical = 8.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    mode.labelZh,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                    color = if (selected) SmsPalette.Ink else SmsPalette.InkMuted
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 1. 推播通道（Shadcn Segmented Control 膠囊切換器）
         item {
             CraftCard {
@@ -1261,7 +1384,10 @@ private fun SettingsTab(
                     onClick = { onSaveConfig(buildDraftConfig()) },
                     modifier = Modifier.fillMaxWidth().height(44.dp),
                     shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = SmsPalette.InkPrimary)
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SmsPalette.InkPrimary,
+                        contentColor = SmsPalette.OnPrimary
+                    )
                 ) {
                     Text("儲存設定", fontWeight = FontWeight.SemiBold)
                 }
@@ -1314,7 +1440,7 @@ private fun SettingsTab(
             }
         }
 
-        // 3. 系統權限中心（附帶受限制設定一鍵跳轉）
+        // 3. 系統權限中心
         item {
             CraftCard {
                 Text("系統權限中心", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
@@ -1337,7 +1463,7 @@ private fun SettingsTab(
                             Text(
                                 "Android 13+ / 小米系統需先開啟「應用程式資訊」➔ 點右上角「⋮」或滑至底部勾選「允許受限制的設定」，返回即可正常開啟。",
                                 fontSize = 12.sp,
-                                color = Color(0xFF92400E)
+                                color = SmsPalette.AmberSubText
                             )
                             OutlinedButton(
                                 onClick = onOpenAppDetails,
@@ -1356,7 +1482,7 @@ private fun SettingsTab(
                     title = "1. 簡訊與電話權限",
                     subtitle = "讀取簡訊、來電號碼與系統雙卡 SIM 資訊",
                     granted = hasSmsPerm && hasCallPerm,
-                    actionLabel = "授予",
+                    actionLabel = "開啟權限",
                     onAction = onRequestSmsPerm
                 )
                 HorizontalDivider(Modifier.padding(vertical = 10.dp), color = SmsPalette.Border)
@@ -1558,7 +1684,14 @@ private fun AppPickerDialog(
             }
         },
         confirmButton = {
-            Button(onClick = onDismiss, shape = RoundedCornerShape(10.dp)) {
+            Button(
+                onClick = onDismiss,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SmsPalette.InkPrimary,
+                    contentColor = SmsPalette.OnPrimary
+                )
+            ) {
                 Text("完成")
             }
         }

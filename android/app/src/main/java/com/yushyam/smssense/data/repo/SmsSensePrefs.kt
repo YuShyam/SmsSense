@@ -120,6 +120,7 @@ class SmsSensePrefs(context: Context) {
                     enabled = obj.optBoolean("enabled", true),
                     deviceAlias = obj.optString("deviceAlias", ""),
                     offlineQueueEnabled = obj.optBoolean("offlineQueueEnabled", true),
+                    themeMode = obj.optString("themeMode", "system").ifBlank { "system" },
                     telegramEnabled = obj.optBoolean("telegramEnabled", true),
                     telegramBotToken = obj.optString("telegramBotToken", ""),
                     telegramChatId = obj.optString("telegramChatId", ""),

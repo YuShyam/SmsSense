@@ -22,12 +22,36 @@ enum class TargetDestination(val label: String) {
 }
 
 /**
+ * 外觀深淺色主題模式 (App Theme Mode)
+ */
+enum class ThemeMode(val settingValue: String, val labelZh: String) {
+    SYSTEM("system", "跟隨系統"),
+    LIGHT("light", "淺色"),
+    DARK("dark", "深色");
+
+    fun next(): ThemeMode = when (this) {
+        SYSTEM -> LIGHT
+        LIGHT -> DARK
+        DARK -> SYSTEM
+    }
+
+    companion object {
+        fun fromSetting(raw: String?): ThemeMode = when (raw?.lowercase()) {
+            "light" -> LIGHT
+            "dark" -> DARK
+            else -> SYSTEM
+        }
+    }
+}
+
+/**
  * 使用者設定與白名單規則 (Configuration & Whitelists)
  */
 data class SmsSenseConfig(
     val enabled: Boolean = true,
     val deviceAlias: String = "",
     val offlineQueueEnabled: Boolean = true,
+    val themeMode: String = ThemeMode.SYSTEM.settingValue,
     // Telegram Bot
     val telegramEnabled: Boolean = true,
     val telegramBotToken: String = "",
