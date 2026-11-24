@@ -4,6 +4,7 @@ import com.yushyam.smssense.data.model.ForwardEvent
 import com.yushyam.smssense.data.model.SmsSenseConfig
 import com.yushyam.smssense.data.model.SourceChannel
 import com.yushyam.smssense.data.repo.SmsSensePrefs
+import com.yushyam.smssense.engine.AppUpdater
 import com.yushyam.smssense.engine.ForwardRuleEngine
 import com.yushyam.smssense.engine.OtpExtractor
 import com.yushyam.smssense.engine.SimSlotResolver
@@ -221,5 +222,32 @@ class ForwardRuleEngineTest {
         val (trig5, sent5) = ForwardRuleEngine.evaluateMultiBatteryThresholds(16, true, thresholds, sent4)
         assertNull(trig5)
         assertTrue(sent5.isEmpty())
+    }
+
+    @Test
+    fun appUpdaterComparesSemanticVersionsAndParsesGitHubReleaseJson() {
+        assertTrue(AppUpdater.isNewerVersion("0.3.1", "v0.3.2"))
+        assertTrue(AppUpdater.isNewerVersion("v0.3.2", "v0.4.0"))
+        assertFalse(AppUpdater.isNewerVersion("0.3.2", "v0.3.2"))
+        assertFalse(AppUpdater.isNewerVersion("0.3.2", "v0.3.1"))
+
+        val sampleJson = """
+            {
+              "tag_name": "v0.3.2",
+              "body": "新增 GitHub 線上自動更新功能",
+              "assets": [
+                {
+                  "name": "SmsSense-v0.3.2.apk",
+                  "browser_download_url": "https://github.com/YuShyam/SmsSense/releases/download/v0.3.2/SmsSense-v0.3.2.apk"
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val parsed = AppUpdater.parseReleaseJson("0.3.1", sampleJson).getOrThrow()
+        assertTrue(parsed.isUpdateAvailable)
+        assertEquals("0.3.1", parsed.currentVersion)
+        assertEquals("0.3.2", parsed.latestVersion)
+        assertEquals("SmsSense-v0.3.2.apk", parsed.assetName)
     }
 }

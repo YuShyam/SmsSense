@@ -61,7 +61,9 @@ import com.yushyam.smssense.data.model.SourceChannel
 import com.yushyam.smssense.data.model.TargetDestination
 import com.yushyam.smssense.data.model.ThemeMode
 import com.yushyam.smssense.data.repo.SmsSensePrefs
+import com.yushyam.smssense.engine.AppUpdater
 import com.yushyam.smssense.engine.ForwardRuleEngine
+import com.yushyam.smssense.engine.ReleaseUpdateInfo
 import com.yushyam.smssense.engine.SimSlotResolver
 import com.yushyam.smssense.receiver.BatteryAlertReceiver
 import com.yushyam.smssense.service.ForwardDispatcher
@@ -70,6 +72,7 @@ import com.yushyam.smssense.service.PromptAccessibilityService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -178,6 +181,40 @@ fun SmsSenseApp(
     var installedApps by remember { mutableStateOf<List<InstalledAppInfo>>(emptyList()) }
     var pickerTarget by remember { mutableStateOf<WhitelistTarget?>(null) }
 
+    val currentVersionName = remember { AppUpdater.currentVersionName(context) }
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+    var updateInfo by remember { mutableStateOf<ReleaseUpdateInfo?>(null) }
+    var showUpdateDialog by remember { mutableStateOf(false) }
+    var isDownloadingUpdate by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0) }
+    var downloadedApkFile by remember { mutableStateOf<File?>(null) }
+    var waitingForInstallPerm by remember { mutableStateOf(false) }
+
+    fun checkForUpdate(manual: Boolean) {
+        if (isCheckingUpdate) return
+        isCheckingUpdate = true
+        scope.launch(Dispatchers.IO) {
+            val res = AppUpdater.checkLatestRelease(context)
+            withContext(Dispatchers.Main) {
+                isCheckingUpdate = false
+                res.onSuccess { info ->
+                    updateInfo = info
+                    if (info.isUpdateAvailable) {
+                        downloadedApkFile = null
+                        downloadProgress = 0
+                        showUpdateDialog = true
+                    } else if (manual) {
+                        onShowToast("目前已是最新版本 (v${info.currentVersion})")
+                    }
+                }.onFailure { err ->
+                    if (manual) {
+                        onShowToast("檢查更新失敗：${err.message ?: "網路異常"}")
+                    }
+                }
+            }
+        }
+    }
+
     val systemDark = isSystemInDarkTheme()
     val currentThemeMode = ThemeMode.fromSetting(config.themeMode)
     val useDark = when (currentThemeMode) {
@@ -246,15 +283,22 @@ fun SmsSenseApp(
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
+            AppUpdater.cleanCachedApks(context)
             val loaded = loadInstalledApps(context)
             withContext(Dispatchers.Main) { installedApps = loaded }
         }
+        checkForUpdate(manual = false)
     }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 refreshState()
+                val pendingApk = downloadedApkFile
+                if (waitingForInstallPerm && pendingApk != null && AppUpdater.canInstallPackages(context)) {
+                    waitingForInstallPerm = false
+                    AppUpdater.installApk(context, pendingApk)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -527,12 +571,15 @@ fun SmsSenseApp(
                         SmsTab.SETTINGS -> SettingsTab(
                             config = config,
                             currentThemeMode = currentThemeMode,
+                            currentVersionName = currentVersionName,
+                            isCheckingUpdate = isCheckingUpdate,
                             hasSmsPerm = hasSmsPerm,
                             hasCallPerm = hasCallPerm,
                             hasNotifPerm = hasNotifPerm,
                             hasPromptPerm = hasPromptPerm,
                             pendingCount = pendingCount,
                             onSelectThemeMode = { mode -> setThemeMode(mode) },
+                            onCheckUpdate = { checkForUpdate(manual = true) },
                             onSaveConfig = { updated ->
                                 prefs.saveConfig(updated)
                                 config = prefs.loadConfig()
@@ -608,6 +655,133 @@ fun SmsSenseApp(
                         }
                         prefs.saveConfig(next)
                         config = next
+                    }
+                )
+            }
+
+            if (showUpdateDialog && updateInfo != null) {
+                val info = updateInfo!!
+                AlertDialog(
+                    containerColor = SmsPalette.Surface,
+                    onDismissRequest = {
+                        if (!isDownloadingUpdate) showUpdateDialog = false
+                    },
+                    title = {
+                        Text(
+                            "發現新版本 ${info.tagName}",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp,
+                            color = SmsPalette.Ink
+                        )
+                    },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                "目前版本：v${info.currentVersion} ➔ 最新版本：v${info.latestVersion}",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = SmsPalette.GreenFg
+                            )
+                            Surface(
+                                color = SmsPalette.Subtle,
+                                border = BorderStroke(1.dp, SmsPalette.Border),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    info.releaseNotes,
+                                    fontSize = 12.sp,
+                                    color = SmsPalette.Ink,
+                                    modifier = Modifier.padding(10.dp)
+                                )
+                            }
+                            if (isDownloadingUpdate) {
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    LinearProgressIndicator(
+                                        progress = { (downloadProgress / 100f).coerceIn(0f, 1f) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(6.dp)
+                                            .clip(RoundedCornerShape(999.dp)),
+                                        color = SmsPalette.InkPrimary,
+                                        trackColor = SmsPalette.Subtle
+                                    )
+                                    Text(
+                                        "下載中... $downloadProgress%",
+                                        fontSize = 12.sp,
+                                        color = SmsPalette.InkMuted
+                                    )
+                                }
+                            } else if (downloadedApkFile != null) {
+                                Text(
+                                    "下載完成！點擊「安裝更新」即可覆蓋升級（保留所有設定）。",
+                                    fontSize = 12.sp,
+                                    color = SmsPalette.GreenFg,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        Button(
+                            enabled = !isDownloadingUpdate,
+                            onClick = {
+                                val readyFile = downloadedApkFile
+                                if (readyFile != null && readyFile.exists()) {
+                                    if (!AppUpdater.canInstallPackages(context)) {
+                                        waitingForInstallPerm = true
+                                        onShowToast("請先開啟「允許安裝未知應用程式」，返回後將自動啟動安裝")
+                                    }
+                                    AppUpdater.installApk(context, readyFile)
+                                } else {
+                                    isDownloadingUpdate = true
+                                    downloadProgress = 0
+                                    scope.launch(Dispatchers.IO) {
+                                        val dl = AppUpdater.downloadApk(
+                                            context = context,
+                                            downloadUrl = info.downloadUrl,
+                                            assetName = info.assetName,
+                                            onProgress = { pct ->
+                                                downloadProgress = pct
+                                            }
+                                        )
+                                        withContext(Dispatchers.Main) {
+                                            isDownloadingUpdate = false
+                                            dl.onSuccess { file ->
+                                                downloadedApkFile = file
+                                                if (!AppUpdater.canInstallPackages(context)) {
+                                                    waitingForInstallPerm = true
+                                                    onShowToast("請先開啟「允許安裝未知應用程式」，返回後將自動啟動安裝")
+                                                }
+                                                AppUpdater.installApk(context, file)
+                                            }.onFailure { err ->
+                                                onShowToast("下載失敗：${err.message ?: "網路錯誤"}")
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SmsPalette.InkPrimary,
+                                contentColor = SmsPalette.OnPrimary
+                            )
+                        ) {
+                            Text(
+                                when {
+                                    isDownloadingUpdate -> "下載中..."
+                                    downloadedApkFile != null -> "安裝更新"
+                                    else -> "立即下載更新"
+                                }
+                            )
+                        }
+                    },
+                    dismissButton = {
+                        if (!isDownloadingUpdate) {
+                            TextButton(onClick = { showUpdateDialog = false }) {
+                                Text("稍後", color = SmsPalette.InkMuted)
+                            }
+                        }
                     }
                 )
             }
@@ -1078,12 +1252,15 @@ private fun PackageRow(label: String, packageName: String, onRemove: () -> Unit)
 private fun SettingsTab(
     config: SmsSenseConfig,
     currentThemeMode: ThemeMode,
+    currentVersionName: String,
+    isCheckingUpdate: Boolean,
     hasSmsPerm: Boolean,
     hasCallPerm: Boolean,
     hasNotifPerm: Boolean,
     hasPromptPerm: Boolean,
     pendingCount: Int,
     onSelectThemeMode: (ThemeMode) -> Unit,
+    onCheckUpdate: () -> Unit,
     onSaveConfig: (SmsSenseConfig) -> Unit,
     onFlushPending: () -> Unit,
     onClearPending: () -> Unit,
@@ -1501,6 +1678,45 @@ private fun SettingsTab(
                     actionLabel = "前往開啟",
                     onAction = onOpenAccessibilitySettings
                 )
+            }
+        }
+
+        // 4. 版本與更新
+        item {
+            CraftCard {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("版本與更新", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = SmsPalette.Ink)
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            "目前版本：v$currentVersionName（啟動時自動檢查 GitHub 更新）",
+                            fontSize = 12.sp,
+                            color = SmsPalette.InkMuted
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = onCheckUpdate,
+                        enabled = !isCheckingUpdate,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, SmsPalette.Border),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = SmsPalette.Surface,
+                            contentColor = SmsPalette.InkPrimary
+                        )
+                    ) {
+                        Text(
+                            if (isCheckingUpdate) "檢查中..." else "檢查更新",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = SmsPalette.InkPrimary
+                        )
+                    }
+                }
             }
         }
     }
